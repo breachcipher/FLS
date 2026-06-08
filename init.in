@@ -1,471 +1,1242 @@
 #!/bin/sh
-# LeakOS Live Initramfs Init Script
-# Fixed version - handles custom /sbin/init ELF crash
+# Init script for LeakOS Live ISO
+# Auto-detect boot media, robust /proc mount handling
+# Fixed: try_mount global, Ventoy loop timing, case pattern, exfat support
+# FIXED: ensure_users works correctly with overlay
+# REMOVED: Public and Templates directories
+# FIXED: live user with correct MD5 password hash
 
-export PATH=/usr/bin:/usr/sbin:/bin:/sbin
-export HOME=/
+PATH=/usr/bin:/usr/sbin:/bin:/sbin
+export PATH
 
-RED=''
-GREEN=''
-YELLOW=''
-NC=''
+# =====================================================
+# RUNTIME SAFETY: Pastikan ld-linux bisa ditemukan
+# dari semua path yang mungkin dicari oleh dynamic linker.
+# Ini safety net jika mkinitramfs menaruhnya di lokasi berbeda.
+# =====================================================
+for ld_src in \
+  /usr/lib/ld-linux-x86-64.so.2 \
+  /lib/ld-linux-x86-64.so.2 \
+  /lib64/ld-linux-x86-64.so.2
+do
+  if [ -f "$ld_src" ]; then
+    # Pastikan semua path alternatif ada sebagai symlink
+    [ -d /lib64 ] || mkdir -p /lib64
+    [ -f /lib64/ld-linux-x86-64.so.2 ] || ln -sf "$ld_src" /lib64/ld-linux-x86-64.so.2 2>/dev/null
+    mkdir -p /lib/x86_64-linux-gnu
+    [ -f /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 ] || \
+      ln -sf "$ld_src" /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 2>/dev/null
+    break
+  fi
+done
 
-# ============================================
-# Fungsi utilitas
-# ============================================
+DEBUG=false
+rootdelay=
 
-log() {
-    echo "[INIT] $*" > /dev/kmsg 2>/dev/null
-    echo "[INIT] $*"
+# mnt_tmp sebagai GLOBAL
+mnt_tmp="/tmpmnt"
+
+log_msg() {
+  local msg="[INIT] $*"
+  if ! echo "$msg" > /dev/kmsg 2>/dev/null; then
+    echo "$msg"
+  fi
 }
 
-warn() {
-    echo "[WARN] $*" > /dev/kmsg 2>/dev/null
-    echo "[WARN] $*"
+problem() {
+  log_msg "ERROR: Problem detected!"
+  printf "\nEncountered a problem!\nDropping to emergency shell...\n\n"
+  printf "Useful commands: lsblk, blkid, losetup, ls, mount, dmesg\n\n"
+  exec /bin/sh
 }
 
-error() {
-    echo "[ERROR] $*" > /dev/kmsg 2>/dev/null
-    echo "[ERROR] $*"
-}
-
-emergency_shell() {
-    echo ""
-    echo "========================================"
-    echo "  EMERGENCY SHELL - LeakOS Debug"
-    echo "========================================"
-    echo "Tips debug:"
-    echo "  lsblk | blkid | mount | dmesg | ls /newroot/sbin"
-    echo "  ldd /newroot/sbin/init"
-    echo "  file /newroot/sbin/init"
-    echo "  cat /proc/cmdline"
-    echo "========================================"
-    echo ""
-    exec /bin/sh
-}
-
-# ============================================
-# Mount basic filesystems
-# ============================================
-
-mount_base() {
-    log "Mounting base filesystems..."
-
-    mount -t devtmpfs devtmpfs /dev 2>/dev/null || \
-        mount -t tmpfs tmpfs /dev 2>/dev/null || \
-        error "devtmpfs failed"
-
-    mount -t proc proc /proc 2>/dev/null       || error "proc failed"
-    mount -t sysfs sysfs /sys 2>/dev/null      || error "sysfs failed"
-    mount -t tmpfs tmpfs /run 2>/dev/null      || warn "tmpfs /run failed"
-    mount -t tmpfs tmpfs /tmp 2>/dev/null      || warn "tmpfs /tmp failed"
-
-    mkdir -p /dev/pts 2>/dev/null
-    mount -t devpts devpts /dev/pts -o gid=5,mode=620 2>/dev/null || warn "devpts failed"
-
-    # Pastikan /dev/null dan /dev/console ada
-    [ -c /dev/null ]    || mknod -m 666 /dev/null    c 1 3
-    [ -c /dev/console ] || mknod -m 600 /dev/console c 5 1
-    [ -c /dev/tty ]     || mknod -m 666 /dev/tty     c 5 0
-    [ -c /dev/tty1 ]    || mknod -m 600 /dev/tty1    c 4 1
-    [ -c /dev/tty2 ]    || mknod -m 600 /dev/tty2    c 4 2
-    [ -c /dev/urandom ] || mknod -m 666 /dev/urandom c 1 9
-    [ -c /dev/random ]  || mknod -m 666 /dev/random  c 1 8
-
-    log "Base filesystems ready"
-}
-
-# ============================================
-# Load kernel modules
-# ============================================
-
-load_modules() {
-    log "Loading kernel modules..."
-
-    for mod in squashfs overlay loop; do
-        modprobe -q "$mod" 2>/dev/null && log "  Loaded: $mod" || warn "  Failed: $mod"
-    done
-
-    for mod in vfat exfat iso9660 ext4 xfs btrfs; do
-        modprobe -q "$mod" 2>/dev/null
-    done
-
-    for mod in usb_storage sr_mod ahci nvme virtio_blk mmc_block; do
-        modprobe -q "$mod" 2>/dev/null
-    done
-
-    for mod in xhci_hcd ehci_hcd uhci_hcd; do
-        modprobe -q "$mod" 2>/dev/null
-    done
-
-    log "Modules loaded"
-}
-
-# ============================================
-# Setup loop devices
-# ============================================
-
-setup_loop_devices() {
-    log "Setting up loop devices..."
-
-    for i in 0 1 2 3 4 5 6 7; do
-        [ -b "/dev/loop$i" ] || mknod -m 660 "/dev/loop$i" b 7 "$i" 2>/dev/null
-    done
-}
-
-# ============================================
-# Start udev
-# ============================================
-
-start_udev() {
-    log "Starting udev..."
-
-    UDEVD=""
-    for p in /usr/lib/systemd/systemd-udevd /usr/lib/udev/udevd /sbin/udevd /usr/sbin/udevd; do
-        [ -x "$p" ] && UDEVD="$p" && break
-    done
-
-    if [ -z "$UDEVD" ]; then
-        warn "udevd not found, skipping"
-        return
+# Cari init di berbagai lokasi umum
+find_init() {
+  for candidate in \
+    /sbin/init \
+    /usr/sbin/init \
+    /usr/lib/systemd/systemd \
+    /lib/systemd/systemd \
+    /usr/lib/sysvinit/init \
+    /bin/init \
+    /bin/sh
+  do
+    if [ -x "/.root${candidate}" ]; then
+      echo "$candidate"
+      return 0
     fi
-
-    $UDEVD --daemon --resolve-names=never 2>/dev/null
-    udevadm trigger --action=add 2>/dev/null
-    udevadm settle --timeout=30 2>/dev/null
-
-    log "udev ready"
+  done
+  return 1
 }
 
-# ============================================
-# Parse kernel command line
-# ============================================
-
-parse_cmdline() {
-    [ -r /proc/cmdline ] || return
-
-    for param in $(cat /proc/cmdline); do
-        case "$param" in
-            debug)
-                log "Debug mode enabled"
-                set -x
-                ;;
-            rootdelay=*)
-                delay="${param#rootdelay=}"
-                log "Root delay: ${delay}s"
-                sleep "$delay"
-                ;;
-            init=*)
-                OVERRIDE_INIT="${param#init=}"
-                log "Init override from cmdline: $OVERRIDE_INIT"
-                ;;
-        esac
-    done
-}
-
-# ============================================
-# Cari boot media dengan lfs.squashfs
-# ============================================
-
-find_boot_media() {
-    local BOOT_MNT="/bootmnt"
-    local timeout=60
-    local elapsed=0
-
-    log "Searching for boot media (timeout: ${timeout}s)..."
-    mkdir -p "$BOOT_MNT" 2>/dev/null
-
-    while [ $elapsed -lt $timeout ]; do
-        for dev in $(ls /sys/block/ 2>/dev/null); do
-            case "$dev" in
-                loop*|ram*|dm-*) continue ;;
-            esac
-
-            # Cek partitions dulu
-            for part in /dev/${dev}p[0-9]* /dev/${dev}[0-9]*; do
-                [ -b "$part" ] || continue
-                for fstype in iso9660 vfat exfat ext4 ext3 ext2; do
-                    if mount -t "$fstype" -o ro "$part" "$BOOT_MNT" 2>/dev/null; then
-                        if [ -f "$BOOT_MNT/boot/lfs.squashfs" ]; then
-                            log "Found boot media: $part"
-                            echo "$part"
-                            return 0
-                        fi
-                        umount "$BOOT_MNT" 2>/dev/null
-                    fi
-                done
-            done
-
-            # Cek whole disk
-            if [ -b "/dev/$dev" ]; then
-                for fstype in iso9660 udf; do
-                    if mount -t "$fstype" -o ro "/dev/$dev" "$BOOT_MNT" 2>/dev/null; then
-                        if [ -f "$BOOT_MNT/boot/lfs.squashfs" ]; then
-                            log "Found boot media: /dev/$dev (whole disk)"
-                            echo "/dev/$dev"
-                            return 0
-                        fi
-                        umount "$BOOT_MNT" 2>/dev/null
-                    fi
-                done
-            fi
-        done
-
-        sleep 2
-        elapsed=$((elapsed + 2))
-        [ $((elapsed % 10)) -eq 0 ] && log "Still searching... (${elapsed}s)"
-    done
-
-    return 1
-}
-
-# ============================================
-# Verifikasi ELF binary dan dependencies
-# ============================================
-
-verify_elf() {
-    local binary="$1"
-    local root="$2"
-
-    # Cek magic bytes ELF
-    if ! dd if="$binary" bs=4 count=1 2>/dev/null | grep -q $'\x7fELF'; then
-        error "  $binary: bukan ELF binary!"
-        return 1
-    fi
-
-    # Cek dynamic linker
-    local interp
-    interp=$(readelf -l "$binary" 2>/dev/null | grep "interpreter" | sed 's/.*\[\(.*\)\]/\1/')
-
-    if [ -n "$interp" ]; then
-        log "  Dynamic linker: $interp"
-        if [ ! -f "${root}${interp}" ]; then
-            error "  MISSING dynamic linker: ${root}${interp}"
-            return 1
-        fi
-        log "  Dynamic linker OK: ${root}${interp}"
-    else
-        log "  Static binary (no dynamic linker needed)"
-    fi
-
-    return 0
-}
-
-# ============================================
-# Mount root filesystem (squashfs + overlay)
-# ============================================
-
-mount_root() {
-    local BOOT_MNT="/bootmnt"
-    local SQUASH_MNT="/squashfs"
-    local ROOT_MNT="/newroot"
-    local COW_DIR="/cow"
-    local UPPER_DIR="$COW_DIR/upper"
-    local WORK_DIR="$COW_DIR/work"
-
-    log "Mounting root filesystem..."
-    mkdir -p "$BOOT_MNT" "$SQUASH_MNT" "$ROOT_MNT" "$COW_DIR"
-
-    # Cari boot media
-    BOOT_DEV=$(find_boot_media)
-    if [ -z "$BOOT_DEV" ]; then
-        error "Boot media dengan lfs.squashfs tidak ditemukan!"
-        lsblk 2>/dev/null || cat /proc/partitions
-        return 1
-    fi
-
-    log "Boot device: $BOOT_DEV"
-
-    # Mount boot media
-    if ! mount -t auto -o ro "$BOOT_DEV" "$BOOT_MNT"; then
-        error "Gagal mount $BOOT_DEV"
-        return 1
-    fi
-
-    log "Boot media mounted di $BOOT_MNT"
-
-    # Verifikasi squashfs ada
-    if [ ! -f "$BOOT_MNT/boot/lfs.squashfs" ]; then
-        error "lfs.squashfs tidak ada di $BOOT_MNT/boot/"
-        ls -la "$BOOT_MNT/boot/" 2>/dev/null
-        return 1
-    fi
-
-    # Mount squashfs
-    if ! mount -t squashfs -o loop "$BOOT_MNT/boot/lfs.squashfs" "$SQUASH_MNT"; then
-        error "Gagal mount squashfs"
-        return 1
-    fi
-
-    log "Squashfs mounted di $SQUASH_MNT"
-
-    # Mount tmpfs untuk overlay
-    if ! mount -t tmpfs -o mode=755 tmpfs "$COW_DIR"; then
-        error "Gagal mount tmpfs untuk overlay"
-        return 1
-    fi
-
-    mkdir -p "$UPPER_DIR" "$WORK_DIR"
-
-    # Mount overlay
-    if ! mount -t overlay overlay \
-        -o lowerdir="$SQUASH_MNT",upperdir="$UPPER_DIR",workdir="$WORK_DIR" \
-        "$ROOT_MNT"; then
-        error "Gagal mount overlay"
-        return 1
-    fi
-
-    log "Overlay mounted di $ROOT_MNT"
-
-    # Bind mount boot media
-    mkdir -p "$ROOT_MNT/mnt/bootmedia" 2>/dev/null
-    mount --bind "$BOOT_MNT" "$ROOT_MNT/mnt/bootmedia" 2>/dev/null || \
-        warn "Gagal bind mount boot media"
-
-    # Pindahkan pseudo-filesystems ke new root
-    mount --move /dev  "$ROOT_MNT/dev"  2>/dev/null || warn "Failed to move /dev"
-    mount --move /proc "$ROOT_MNT/proc" 2>/dev/null || warn "Failed to move /proc"
-    mount --move /sys  "$ROOT_MNT/sys"  2>/dev/null || warn "Failed to move /sys"
-    mount --move /run  "$ROOT_MNT/run"  2>/dev/null || warn "Failed to move /run"
-
-    mkdir -p "$ROOT_MNT/dev/pts" 2>/dev/null
-    mount -t devpts devpts "$ROOT_MNT/dev/pts" -o gid=5,mode=620 2>/dev/null || \
-        warn "devpts di newroot gagal"
-
-    # Pastikan /dev/null ada di newroot
-    [ -c "$ROOT_MNT/dev/null" ] || \
-        mknod -m 666 "$ROOT_MNT/dev/null" c 1 3 2>/dev/null
-
-    log "Root filesystem siap di $ROOT_MNT"
-    echo "$ROOT_MNT"
-    return 0
-}
-
-# ============================================
-# Cari dan verifikasi init di new root
-# ============================================
-
-find_root_init() {
-    local ROOT_MNT="$1"
-
-    # Jika ada override dari cmdline
-    if [ -n "$OVERRIDE_INIT" ]; then
-        if [ -x "$ROOT_MNT$OVERRIDE_INIT" ]; then
-            log "Using cmdline init: $OVERRIDE_INIT"
-            echo "$OVERRIDE_INIT"
-            return 0
-        else
-            error "Override init tidak ditemukan: $ROOT_MNT$OVERRIDE_INIT"
-        fi
-    fi
-
-    # Cek kandidat init
-    for init in \
-        /sbin/init \
-        /usr/sbin/init \
-        /bin/init \
-        /usr/bin/init \
-        /usr/lib/systemd/systemd \
-        /lib/systemd/systemd \
-        /sbin/openrc-init \
-        /init
-    do
-        if [ -x "$ROOT_MNT$init" ]; then
-            log "Checking init candidate: $init"
-
-            # Verifikasi ELF dan dependencies
-            if verify_elf "$ROOT_MNT$init" "$ROOT_MNT"; then
-                log "Init valid: $init"
-                echo "$init"
-                return 0
-            else
-                warn "Init $init gagal verifikasi, coba kandidat lain..."
-            fi
-        fi
-    done
-
-    # Fallback ke /bin/sh
-    if [ -x "$ROOT_MNT/bin/sh" ]; then
-        warn "Tidak ada init yang valid, fallback ke /bin/sh"
-        echo "/bin/sh"
+# =====================================================
+# try_mount: GLOBAL (bukan nested) agar kompatibel
+# dengan semua sh/dash/ash
+# =====================================================
+try_mount() {
+  local d="$1"
+  [ -b "$d" ] || return 1
+  # exfat ditambahkan — beberapa USB modern pakai exFAT
+  for fstype in iso9660 vfat exfat ext4 ext3 ext2 xfs btrfs auto; do
+    if mount -t "$fstype" -o ro "$d" "$mnt_tmp" 2>/dev/null; then
+      if [ -f "$mnt_tmp/boot/lfs.squashfs" ]; then
         return 0
+      fi
+      umount "$mnt_tmp" 2>/dev/null
     fi
+  done
+  return 1
+}
 
+# =====================================================
+# find_boot_device: scan semua media secara berurutan
+# =====================================================
+find_boot_device() {
+  local timeout=90
+  local count=0
+
+  log_msg "Auto-detecting boot media (timeout: ${timeout}s)..."
+  log_msg "Looking for /boot/lfs.squashfs on available devices..."
+
+  mkdir -p "$mnt_tmp" 2>/dev/null
+
+  # Tunggu udev settle — penting agar loop device & USB sudah terdaftar
+  # sebelum mulai scan (kritis untuk Ventoy)
+  log_msg "Waiting for udev to settle..."
+  udevadm settle --timeout=10 2>/dev/null || sleep 3
+
+  while [ $count -lt $timeout ]; do
+
+    # --------------------------------------------------
+    # PRIORITAS 1: Loop device aktif (Ventoy)
+    # --------------------------------------------------
+    for dev in /dev/loop0 /dev/loop1 /dev/loop2 /dev/loop3 \
+               /dev/loop4 /dev/loop5 /dev/loop6 /dev/loop7; do
+      [ -b "$dev" ] || continue
+      losetup "$dev" 2>/dev/null | grep -q '/' || continue
+      log_msg "Probing loop $dev (Ventoy)..."
+      if try_mount "$dev"; then
+        device="$dev"
+        log_msg "Boot media DETECTED on loop $dev (Ventoy)"
+        return 0
+      fi
+    done
+
+    # --------------------------------------------------
+    # PRIORITAS 2: USB removable (sdb, sdc, sdd, sde)
+    # --------------------------------------------------
+    for dev in /dev/sd[b-e][0-9]*; do
+      [ -b "$dev" ] || continue
+      log_msg "Probing USB partition $dev..."
+      if try_mount "$dev"; then
+        device="$dev"
+        log_msg "Boot media DETECTED on USB $dev"
+        return 0
+      fi
+    done
+    for dev in /dev/sd[b-e]; do
+      [ -b "$dev" ] || continue
+      log_msg "Probing USB disk $dev..."
+      if try_mount "$dev"; then
+        device="$dev"
+        log_msg "Boot media DETECTED on USB $dev"
+        return 0
+      fi
+    done
+
+    # --------------------------------------------------
+    # PRIORITAS 3: Optical (sr*, cdrom, dvd)
+    # --------------------------------------------------
+    for dev in /dev/sr[0-9]* /dev/cdrom* /dev/dvd*; do
+      [ -b "$dev" ] || continue
+      log_msg "Probing optical $dev..."
+      if try_mount "$dev"; then
+        device="$dev"
+        log_msg "Boot media DETECTED on optical $dev"
+        return 0
+      fi
+    done
+
+    # --------------------------------------------------
+    # PRIORITAS 4: NVMe
+    # --------------------------------------------------
+    for dev in /dev/nvme[0-9]n[0-9]p[0-9]*; do
+      [ -b "$dev" ] || continue
+      log_msg "Probing NVMe partition $dev..."
+      if try_mount "$dev"; then
+        device="$dev"
+        log_msg "Boot media DETECTED on NVMe $dev"
+        return 0
+      fi
+    done
+    for dev in /dev/nvme[0-9]n[0-9]; do
+      [ -b "$dev" ] || continue
+      log_msg "Probing NVMe disk $dev..."
+      if try_mount "$dev"; then
+        device="$dev"
+        log_msg "Boot media DETECTED on NVMe $dev"
+        return 0
+      fi
+    done
+
+    # --------------------------------------------------
+    # PRIORITAS 5: VirtIO (QEMU/KVM/VirtualBox)
+    # --------------------------------------------------
+    for dev in /dev/vd[a-z][0-9]*; do
+      [ -b "$dev" ] || continue
+      log_msg "Probing VirtIO partition $dev..."
+      if try_mount "$dev"; then
+        device="$dev"
+        log_msg "Boot media DETECTED on VirtIO $dev"
+        return 0
+      fi
+    done
+    for dev in /dev/vd[a-z]; do
+      [ -b "$dev" ] || continue
+      log_msg "Probing VirtIO disk $dev..."
+      if try_mount "$dev"; then
+        device="$dev"
+        log_msg "Boot media DETECTED on VirtIO $dev"
+        return 0
+      fi
+    done
+
+    # --------------------------------------------------
+    # PRIORITAS 6: eMMC / SD card
+    # --------------------------------------------------
+    for dev in /dev/mmcblk[0-9]p[0-9]*; do
+      [ -b "$dev" ] || continue
+      log_msg "Probing eMMC partition $dev..."
+      if try_mount "$dev"; then
+        device="$dev"
+        log_msg "Boot media DETECTED on eMMC $dev"
+        return 0
+      fi
+    done
+    for dev in /dev/mmcblk[0-9]; do
+      [ -b "$dev" ] || continue
+      log_msg "Probing eMMC disk $dev..."
+      if try_mount "$dev"; then
+        device="$dev"
+        log_msg "Boot media DETECTED on eMMC $dev"
+        return 0
+      fi
+    done
+
+    # --------------------------------------------------
+    # PRIORITAS 7: sda — internal disk / Rufus DD mode
+    # --------------------------------------------------
+    for dev in /dev/sda[0-9]*; do
+      [ -b "$dev" ] || continue
+      log_msg "Probing sda partition $dev..."
+      if try_mount "$dev"; then
+        device="$dev"
+        log_msg "Boot media DETECTED on $dev"
+        return 0
+      fi
+    done
+    for dev in /dev/sda; do
+      [ -b "$dev" ] || continue
+      log_msg "Probing sda disk $dev..."
+      if try_mount "$dev"; then
+        device="$dev"
+        log_msg "Boot media DETECTED on $dev"
+        return 0
+      fi
+    done
+
+    # --------------------------------------------------
+    # PRIORITAS 8: Fallback lsblk
+    # --------------------------------------------------
+    for dev in $(lsblk -pnlo NAME 2>/dev/null); do
+      [ -b "$dev" ] || continue
+      case "$dev" in
+        /dev/loop[0-9]*)  continue ;;
+        /dev/sd[a-z]*)    continue ;;
+        /dev/nvme*)       continue ;;
+        /dev/vd[a-z]*)    continue ;;
+        /dev/mmcblk*)     continue ;;
+        /dev/sr*)         continue ;;
+        /dev/cdrom*)      continue ;;
+        /dev/dvd*)        continue ;;
+      esac
+      log_msg "Probing fallback $dev..."
+      if try_mount "$dev"; then
+        device="$dev"
+        log_msg "Boot media DETECTED on fallback $dev"
+        return 0
+      fi
+    done
+
+    sleep 2
+    count=$((count + 2))
+    [ $((count % 10)) -eq 0 ] && log_msg "Still scanning... (${count}s elapsed)"
+  done
+
+  log_msg "ERROR: No valid boot media found after ${timeout}s"
+  log_msg "=== blkid ==="
+  blkid 2>/dev/null || true
+  log_msg "=== lsblk ==="
+  lsblk -f 2>/dev/null || true
+  log_msg "=== losetup ==="
+  losetup -l 2>/dev/null || true
+  problem
+  return 1
+}
+
+ensure_users() {
+  log_msg "=== Ensuring user database exists in overlay ==="
+  
+  mkdir -p /.root/etc 2>/dev/null
+  
+  # =====================================================
+  
+  # =====================================================
+  # /etc/passwd - Lengkap dengan semua user yang dibutuhkan
+  # =====================================================
+  cat > /.root/etc/passwd << 'EOF'
+root:x:0:0:root:/root:/bin/bash
+daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin
+bin:x:2:2:bin:/bin:/usr/sbin/nologin
+sys:x:3:3:sys:/dev:/usr/sbin/nologin
+sync:x:4:65534:sync:/bin:/bin/sync
+games:x:5:60:games:/usr/games:/usr/sbin/nologin
+man:x:6:12:man:/var/cache/man:/usr/sbin/nologin
+lp:x:7:7:lp:/var/spool/lpd:/usr/sbin/nologin
+mail:x:8:8:mail:/var/mail:/usr/sbin/nologin
+news:x:9:9:news:/var/spool/news:/usr/sbin/nologin
+uucp:x:10:10:uucp:/var/spool/uucp:/usr/sbin/nologin
+proxy:x:13:13:proxy:/bin:/usr/sbin/nologin
+www-data:x:33:33:www-data:/var/www:/usr/sbin/nologin
+backup:x:34:34:backup:/var/backups:/usr/sbin/nologin
+list:x:38:38:Mailing List Manager:/var/list:/usr/sbin/nologin
+irc:x:39:39:ircd:/var/run/ircd:/usr/sbin/nologin
+gnats:x:41:41:Gnats Bug-Reporting System (admin):/var/lib/gnats:/usr/sbin/nologin
+nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin
+systemd-network:x:100:102:systemd Network Management:/run/systemd:/usr/sbin/nologin
+systemd-resolve:x:101:103:systemd Resolver:/run/systemd:/usr/sbin/nologin
+messagebus:x:102:105:D-Bus Message Daemon:/nonexistent:/usr/sbin/nologin
+polkitd:x:103:106:PolicyKit daemon:/var/lib/polkit:/usr/sbin/nologin
+avahi:x:104:107:Avahi mDNS daemon:/var/run/avahi-daemon:/usr/sbin/nologin
+pulse:x:105:108:PulseAudio:/var/run/pulse:/usr/sbin/nologin
+apache:x:106:109:Apache:/var/www:/usr/sbin/nologin
+postgres:x:107:110:PostgreSQL:/var/lib/postgresql:/usr/sbin/nologin
+lightdm:x:108:111:LightDM:/var/lib/lightdm:/usr/sbin/nologin
+colord:x:109:112:Color management daemon:/var/lib/colord:/usr/sbin/nologin
+rtkit:x:110:113:RealtimeKit:/proc:/usr/sbin/nologin
+usbmux:x:111:114:usbmux user:/var/lib/usbmux:/usr/sbin/nologin
+ntp:x:112:115:Network Time Protocol:/var/empty:/usr/sbin/nologin
+live:x:1000:1000:Live User:/home/live:/bin/bash
+EOF
+
+  # =====================================================
+  # /etc/shadow - Password kosong (akan diisi firstboot)
+  # =====================================================
+  cat > /.root/etc/shadow << 'EOF'
+root:$6$leakos$iZ2h.Cd1jhjXdwAqaNqT36fsrPTKrazstfj1UCVpeDj0KarqnJrv.LfXlFJ.YRZDapuC81UzfO8wcx70k.iUs0:19490:0:99999:7:::
+daemon:*:19490:0:99999:7:::
+bin:*:19490:0:99999:7:::
+sys:*:19490:0:99999:7:::
+sync:*:19490:0:99999:7:::
+games:*:19490:0:99999:7:::
+man:*:19490:0:99999:7:::
+lp:*:19490:0:99999:7:::
+mail:*:19490:0:99999:7:::
+news:*:19490:0:99999:7:::
+uucp:*:19490:0:99999:7:::
+proxy:*:19490:0:99999:7:::
+www-data:*:19490:0:99999:7:::
+backup:*:19490:0:99999:7:::
+list:*:19490:0:99999:7:::
+irc:*:19490:0:99999:7:::
+gnats:*:19490:0:99999:7:::
+nobody:*:19490:0:99999:7:::
+systemd-network:*:19490:0:99999:7:::
+systemd-resolve:*:19490:0:99999:7:::
+messagebus:*:19490:0:99999:7:::
+polkitd:*:19490:0:99999:7:::
+avahi:*:19490:0:99999:7:::
+pulse:*:19490:0:99999:7:::
+apache:*:19490:0:99999:7:::
+postgres:*:19490:0:99999:7:::
+lightdm:*:19490:0:99999:7:::
+colord:*:19490:0:99999:7:::
+rtkit:*:19490:0:99999:7:::
+usbmux:*:19490:0:99999:7:::
+ntp:*:19490:0:99999:7:::
+live:$6$Sl9yP6SvbA1I8qg1$hN4tpC7RBQENGpCIyl/UrF9SzBppGQ7nWrrPgtrSbno8Bzmzm61WmmsTsrURsWlzbyIgHHGioTc9VyL.LoLKt/:19490:0:99999:7:::
+EOF
+
+  chmod 600 /.root/etc/shadow
+
+  # =====================================================
+  # /etc/group - Lengkap dengan semua group yang dibutuhkan
+  # =====================================================
+  cat > /.root/etc/group << 'EOF'
+root:x:0:
+daemon:x:1:
+bin:x:2:
+sys:x:3:
+adm:x:4:
+tty:x:5:
+disk:x:6:
+lp:x:7:
+mail:x:8:
+news:x:9:
+uucp:x:10:
+man:x:12:
+proxy:x:13:
+kmem:x:15:
+dialout:x:20:
+fax:x:21:
+voice:x:22:
+cdrom:x:24:
+floppy:x:25:
+tape:x:26:
+sudo:x:27:live
+audio:x:29:
+dip:x:30:
+www-data:x:33:
+backup:x:34:
+operator:x:37:
+list:x:38:
+irc:x:39:
+src:x:40:
+gnats:x:41:
+shadow:x:42:
+utmp:x:43:
+video:x:44:
+sasl:x:45:
+plugdev:x:46:
+staff:x:50:
+games:x:60:
+users:x:100:
+nogroup:x:65534:
+systemd-journal:x:101:
+systemd-network:x:102:
+systemd-resolve:x:103:
+input:x:104:
+crontab:x:105:
+netdev:x:106:live
+polkitd:x:107:
+avahi:x:108:
+pulse:x:109:live,pulse
+pulse-access:x:110:
+rtkit:x:111:
+colord:x:112:
+lightdm:x:113:
+usbmux:x:114:
+wheel:x:10:live
+apache:x:115:
+postgres:x:116:
+live:x:1000:
+EOF
+
+  # =====================================================
+  # /etc/sudoers - live bisa sudo tanpa password
+  # =====================================================
+  cat > /.root/etc/sudoers << 'EOF'
+# /etc/sudoers
+Defaults env_reset
+Defaults mail_badpass
+Defaults secure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+# User privilege specification
+root ALL=(ALL:ALL) ALL
+live ALL=(ALL:ALL) ALL
+
+# Allow members of group sudo to execute any command
+%sudo ALL=(ALL:ALL) ALL
+
+# Allow members of group wheel to execute any command
+%wheel ALL=(ALL:ALL) ALL
+EOF
+  
+  chmod 440 /.root/etc/sudoers
+
+  # =====================================================
+  # PAM configuration (minimal)
+  # =====================================================
+  mkdir -p /.root/etc/pam.d
+  
+  cat > /.root/etc/pam.d/system-auth << 'EOF'
+#%PAM-1.0
+auth        required      pam_unix.so nullok try_first_pass
+account     required      pam_unix.so
+session     required      pam_unix.so
+password    required      pam_unix.so nullok md5 shadow
+EOF
+
+  cat > /.root/etc/pam.d/login << 'EOF'
+auth       include      system-auth
+account    include      system-auth
+session    include      system-auth
+password   include      system-auth
+EOF
+
+  cat > /.root/etc/pam.d/sudo << 'EOF'
+auth       include      system-auth
+account    include      system-auth
+session    include      system-auth
+EOF
+
+  cat > /.root/etc/pam.d/passwd << 'EOF'
+password   include      system-auth
+EOF
+
+  cat > /.root/etc/pam.d/lightdm << 'EOF'
+auth       include      system-auth
+account    include      system-auth
+session    include      system-auth
+EOF
+
+  # =====================================================
+  # First Boot Script untuk set password live
+  # =====================================================
+  mkdir -p /.root/usr/local/bin
+  cat > /.root/usr/local/bin/firstboot-setup << 'EOF'
+#!/bin/bash
+# First boot setup script for LeakOS Live
+
+if [ ! -f /var/log/firstboot.done ]; then
+  echo ""
+  echo "========================================="
+  echo "  LeakOS Live - First Boot Setup"
+  echo "========================================="
+  
+  # Set password untuk live user (jika masih kosong)
+  if grep -q "^live::" /etc/shadow 2>/dev/null; then
+    echo "Setting password for user 'live'..."
+    echo "live:leakos" | chpasswd 2>/dev/null
+    if [ $? -eq 0 ]; then
+      echo "✓ Password set to: leakos"
+    else
+      echo "⚠ Failed to set password via chpasswd, trying alternate method..."
+      # Alternate method
+      printf "live\nlive\n" | passwd live 2>/dev/null
+    fi
+  fi
+  
+  # Set password untuk root (optional)
+  if grep -q "^root::" /etc/shadow 2>/dev/null; then
+    echo "Setting password for 'root'..."
+    echo "root:toor" | chpasswd 2>/dev/null
+  fi
+  
+  # Buat file marker
+  touch /var/log/firstboot.done
+  
+  echo ""
+  echo "========================================="
+  echo "  Setup complete!"
+  echo "  Login with: live / live"
+  echo "========================================="
+  echo ""
+fi
+EOF
+  chmod 755 /.root/usr/local/bin/firstboot-setup
+
+  # =====================================================
+  # Setup rc.local untuk menjalankan firstboot script
+  # =====================================================
+  mkdir -p /.root/etc/rc.d
+  cat > /.root/etc/rc.d/rc.local << 'EOF'
+#!/bin/sh
+# rc.local for LeakOS Live
+
+# Run first boot setup in background
+/usr/local/bin/firstboot-setup &
+
+exit 0
+EOF
+  chmod 755 /.root/etc/rc.d/rc.local 2>/dev/null || true
+
+  # =====================================================
+  # Setup home directory untuk live (tanpa Public dan Templates)
+  # =====================================================
+  log_msg "Setting up home directory for live user..."
+  
+  mkdir -p /.root/home/live 2>/dev/null
+  mkdir -p /.root/home/live/{Desktop,Documents,Downloads,Music,Pictures,Videos} 2>/dev/null
+  mkdir -p /.root/home/live/.config 2>/dev/null
+  mkdir -p /.root/home/live/.local/share 2>/dev/null
+  mkdir -p /.root/home/live/.cache 2>/dev/null
+  
+  # .bashrc untuk live
+  cat > /.root/home/live/.bashrc << 'EOF'
+# ~/.bashrc for LeakOS Live
+
+# If not running interactively, don't do anything
+case $- in
+    *i*) ;;
+      *) return;;
+esac
+
+# History settings
+HISTCONTROL=ignoreboth
+shopt -s histappend
+HISTSIZE=1000
+HISTFILESIZE=2000
+shopt -s checkwinsize
+
+# Color prompt
+if [ "$TERM" != "dumb" ]; then
+    PS1='\[\033[01;32m\]\u@\h\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ '
+else
+    PS1='\u@\h:\w\$ '
+fi
+
+# Color support for ls
+if [ -x /usr/bin/dircolors ]; then
+    test -r ~/.dircolors && eval "$(dircolors -b ~/.dircolors)" || eval "$(dircolors -b)"
+    alias ls='ls --color=auto'
+    alias grep='grep --color=auto'
+    alias fgrep='fgrep --color=auto'
+    alias egrep='egrep --color=auto'
+fi
+
+# Aliases
+alias ll='ls -alF'
+alias la='ls -A'
+alias l='ls -CF'
+alias ..='cd ..'
+alias ...='cd ../..'
+
+# Custom PATH
+export PATH="$HOME/bin:$HOME/.local/bin:$PATH"
+
+# Welcome message
+echo "Welcome to LeakOS Live!"
+echo "Type 'help' for available commands"
+EOF
+
+  # .profile untuk live
+  cat > /.root/home/live/.profile << 'EOF'
+# ~/.profile for LeakOS Live
+
+if [ -n "$BASH_VERSION" ]; then
+    if [ -f "$HOME/.bashrc" ]; then
+        . "$HOME/.bashrc"
+    fi
+fi
+
+if [ -d "$HOME/bin" ] ; then
+    PATH="$HOME/bin:$PATH"
+fi
+
+if [ -d "$HOME/.local/bin" ] ; then
+    PATH="$HOME/.local/bin:$PATH"
+fi
+EOF
+
+  chown -R 1000:1000 /.root/home/live 2>/dev/null || true
+  chmod 755 /.root/home/live 2>/dev/null || true
+  chmod 700 /.root/home/live/.ssh 2>/dev/null || true
+  chmod 700 /.root/home/live/.gnupg 2>/dev/null || true
+  
+  # =====================================================
+  # /etc/skel untuk template (tanpa Public dan Templates)
+  # =====================================================
+  mkdir -p /.root/etc/skel 2>/dev/null
+  mkdir -p /.root/etc/skel/{Desktop,Documents,Downloads,Music,Pictures,Videos} 2>/dev/null
+  
+  cat > /.root/etc/skel/.bashrc << 'EOF'
+# ~/.bashrc for new users
+case $- in
+    *i*) ;;
+      *) return;;
+esac
+
+HISTCONTROL=ignoreboth
+shopt -s histappend
+HISTSIZE=1000
+HISTFILESIZE=2000
+shopt -s checkwinsize
+
+if [ "$TERM" != "dumb" ]; then
+    PS1='\[\033[01;32m\]\u@\h\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ '
+else
+    PS1='\u@\h:\w\$ '
+fi
+
+if [ -x /usr/bin/dircolors ]; then
+    test -r ~/.dircolors && eval "$(dircolors -b ~/.dircolors)" || eval "$(dircolors -b)"
+    alias ls='ls --color=auto'
+    alias grep='grep --color=auto'
+fi
+
+alias ll='ls -alF'
+alias la='ls -A'
+alias l='ls -CF'
+EOF
+
+  cat > /.root/etc/skel/.profile << 'EOF'
+# ~/.profile
+if [ -n "$BASH_VERSION" ]; then
+    if [ -f "$HOME/.bashrc" ]; then
+        . "$HOME/.bashrc"
+    fi
+fi
+
+if [ -d "$HOME/bin" ] ; then
+    PATH="$HOME/bin:$PATH"
+fi
+
+if [ -d "$HOME/.local/bin" ] ; then
+    PATH="$HOME/.local/bin:$PATH"
+fi
+EOF
+
+  # =====================================================
+  # Verifikasi
+  # =====================================================
+  log_msg "=== Verifikasi user setup ==="
+  for user in live polkitd avahi pulse apache postgres lightdm colord rtkit usbmux ntp; do
+    if grep -q "^${user}:" /.root/etc/passwd; then
+      log_msg "✓ ${user} user found"
+    else
+      log_msg "✗ WARNING: ${user} user NOT found!"
+    fi
+  done
+  
+  for group in netdev sudo wheel audio video pulse-access; do
+    if grep -q "^${group}:" /.root/etc/group; then
+      log_msg "✓ ${group} group found"
+    else
+      log_msg "✗ WARNING: ${group} group NOT found!"
+    fi
+  done
+  
+  if grep -q "live.*PASSWD" /.root/etc/sudoers; then
+    log_msg "✓ sudoers configured for live (PASSWD)"
+  fi
+  
+  if [ -d /.root/home/live ]; then
+    log_msg "✓ /home/live directory exists"
+    log_msg "  Directories: Desktop, Documents, Downloads, Music, Pictures, Videos"
+  fi
+  
+  log_msg "User setup complete! (user: live, password will be set on first boot)"
+}
+
+ensure_system() {
+  log_msg "Ensuring system files exist in overlay..."
+
+  # =====================================================
+  # /etc/fstab
+  # =====================================================
+  if [ ! -f /.root/etc/fstab ] || [ ! -s /.root/etc/fstab ]; then
+    log_msg "Creating minimal /etc/fstab..."
+    cat > /.root/etc/fstab << 'EOF'
+# /etc/fstab for LeakOS Live
+proc            /proc     proc     defaults          0 0
+sysfs           /sys      sysfs    defaults          0 0
+devtmpfs        /dev      devtmpfs defaults          0 0
+tmpfs           /tmp      tmpfs    defaults,noatime  0 0
+tmpfs           /run      tmpfs    defaults,noatime  0 0
+EOF
+    chmod 644 /.root/etc/fstab
+  fi
+
+mkdir -p /.root/etc/udev/rules.d
+  
+  cat > /.root/etc/udev/rules.d/70-persistent-net.rules << 'EOF'
+# Udev rules for persistent network interface names
+# Rename first WiFi interface to wlan0
+
+SUBSYSTEM=="net", ACTION=="add", DRIVERS=="?*", KERNEL=="wl*|wlan*|wlp*|wi*", ATTR{type}=="1", NAME="wlan0"
+EOF
+
+  cat > /.root/etc/udev/rules.d/71-wifi-detection.rules << 'EOF'
+# Trigger WiFi module loading
+ACTION=="add", SUBSYSTEM=="pci", ENV{ID_NET_DRIVER}=="iwlwifi|ath9k|b43|rtl*", RUN+="/sbin/modprobe $env{ID_NET_DRIVER}"
+EOF
+
+  # =====================================================
+  # /etc/hostname
+  # =====================================================
+  echo "leakos" > /.root/etc/hostname
+
+  # =====================================================
+  # /etc/hosts
+  # =====================================================
+  cat > /.root/etc/hosts << 'EOF'
+127.0.0.1       localhost
+127.0.1.1       leakos
+
+::1             localhost ip6-localhost ip6-loopback
+ff02::1         ip6-allnodes
+ff02::2         ip6-allrouters
+EOF
+
+  # =====================================================
+  # Buat direktori yang diperlukan oleh service
+  # =====================================================
+  log_msg "Creating service directories..."
+  
+  # Directories for various services
+  mkdir -p /.root/var/{log,lib,spool,run,lock,cache,tmp}
+  mkdir -p /.root/var/log/{httpd,apache2,nginx,mysql,postgresql,lightdm}
+  mkdir -p /.root/var/lib/{polkit,avahi-daemon,postgresql,apache2,mysql,colord,lightdm}
+  mkdir -p /.root/var/run/{dbus,apache2,postgresql,avahi-daemon,polkit,lightdm}
+  mkdir -p /.root/run/{dbus,lock,avahi-daemon,polkit,lightdm,user}
+  mkdir -p /.root/etc/{dbus-1/system.d,avahi,polkit-1/rules.d,lightdm}
+  mkdir -p /.root/usr/lib/systemd/system
+  mkdir -p /.root/cache
+  mkdir -p /.root/home
+  mkdir -p /.root/media
+  mkdir -p /.root/mnt
+  mkdir -p /.root/opt
+  mkdir -p /.root/srv
+  
+  # =====================================================
+  # Setup permission untuk direktori
+  # =====================================================
+  chmod 755 /.root/var/log
+  chmod 755 /.root/var/log/httpd 2>/dev/null || true
+  chmod 755 /.root/var/log/apache2 2>/dev/null || true
+  chmod 1777 /.root/tmp
+  chmod 755 /.root/run
+  chmod 755 /.root/var/run
+  chmod 755 /.root/var/lib
+  chmod 755 /.root/var/spool
+  
+  # =====================================================
+  # Create asound.state for ALSA
+  # =====================================================
+  mkdir -p /.root/var/lib/alsa
+  touch /.root/var/lib/alsa/asound.state
+  chmod 644 /.root/var/lib/alsa/asound.state
+  
+  # =====================================================
+  # Create .bashrc for root
+  # =====================================================
+  cat > /.root/.bashrc << 'EOF'
+# ~/.bashrc for root
+
+# If not running interactively, don't do anything
+case $- in
+    *i*) ;;
+      *) return;;
+esac
+
+# History settings
+HISTCONTROL=ignoreboth
+shopt -s histappend
+HISTSIZE=1000
+HISTFILESIZE=2000
+shopt -s checkwinsize
+
+# Color prompt — merah untuk root
+if [ "$TERM" != "dumb" ]; then
+    PS1='\[\033[01;31m\]\u@\h\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ '
+else
+    PS1='\u@\h:\w\$ '
+fi
+
+# Color support for ls
+if [ -x /usr/bin/dircolors ]; then
+    test -r ~/.dircolors && eval "$(dircolors -b ~/.dircolors)" || eval "$(dircolors -b)"
+    alias ls='ls --color=auto'
+    alias grep='grep --color=auto'
+    alias fgrep='fgrep --color=auto'
+    alias egrep='egrep --color=auto'
+fi
+
+# Aliases
+alias ll='ls -alF'
+alias la='ls -A'
+alias l='ls -CF'
+alias ..='cd ..'
+alias ...='cd ../..'
+
+# Custom PATH
+export PATH="$HOME/bin:$HOME/.local/bin:$PATH"
+
+# (no duplicate welcome message)
+echo "Type 'help' for available commands"
+EOF
+
+  # .profile untuk root — wajib agar sudo su baca .bashrc
+  cat > /.root/.profile << 'EOF'
+# ~/.profile for root
+if [ -n "$BASH_VERSION" ]; then
+    if [ -f "$HOME/.bashrc" ]; then
+        . "$HOME/.bashrc"
+    fi
+fi
+export PATH="$HOME/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+EOF
+
+  # Pastikan /root ada, permission benar, dan .bashrc ada di sana
+  mkdir -p /.root/root
+  chmod 700 /.root/root
+
+
+  # =====================================================
+  # /etc/localtime
+  # =====================================================
+  ln -sf /usr/share/zoneinfo/UTC /.root/etc/localtime 2>/dev/null || true
+
+  # =====================================================
+  # Konfigurasi Apache / httpd
+  # =====================================================
+  if [ -f /.root/etc/httpd/conf/httpd.conf ]; then
+    sed -i 's/^#ServerName.*/ServerName localhost/' /.root/etc/httpd/conf/httpd.conf 2>/dev/null || true
+    sed -i 's|^ErrorLog.*|ErrorLog "/var/log/httpd/error_log"|' /.root/etc/httpd/conf/httpd.conf 2>/dev/null || true
+  fi
+  
+  if [ -f /.root/etc/apache2/httpd.conf ]; then
+    sed -i 's/^#ServerName.*/ServerName localhost/' /.root/etc/apache2/httpd.conf 2>/dev/null || true
+    sed -i 's|^ErrorLog.*|ErrorLog "/var/log/apache2/error_log"|' /.root/etc/apache2/httpd.conf 2>/dev/null || true
+  fi
+
+  # =====================================================
+  # Konfigurasi Avahi
+  # =====================================================
+  mkdir -p /.root/etc/avahi
+  cat > /.root/etc/avahi/avahi-daemon.conf << 'EOF'
+[server]
+host-name=leakos
+domain-name=local
+use-ipv4=yes
+use-ipv6=yes
+check-response-ttl=no
+use-iff-running=no
+
+[wide-area]
+enable-wide-area=yes
+
+[publish]
+publish-addresses=yes
+publish-hinfo=no
+publish-workstation=no
+publish-domain=yes
+publish-dns-servers=192.168.1.1
+publish-resolv-conf-dns-servers=yes
+
+[reflector]
+enable-reflector=no
+reflect-ipv=no
+
+[rlimits]
+rlimit-core=0
+rlimit-data=8388608
+rlimit-fsize=0
+rlimit-nofile=768
+rlimit-stack=8388608
+rlimit-nproc=3
+EOF
+
+  # =====================================================
+  # Konfigurasi D-Bus untuk Avahi
+  # =====================================================
+  mkdir -p /.root/etc/dbus-1/system.d
+  cat > /.root/etc/dbus-1/system.d/avahi-dbus.conf << 'EOF'
+<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-BUS Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <policy user="avahi">
+    <allow own="org.freedesktop.Avahi"/>
+    <allow send_destination="org.freedesktop.Avahi"/>
+    <allow receive_sender="org.freedesktop.Avahi"/>
+  </policy>
+  <policy context="default">
+    <allow send_destination="org.freedesktop.Avahi"/>
+    <allow receive_sender="org.freedesktop.Avahi"/>
+  </policy>
+</busconfig>
+EOF
+
+  # =====================================================
+  # Konfigurasi Polkit
+  # =====================================================
+  mkdir -p /.root/etc/polkit-1/rules.d
+  cat > /.root/etc/polkit-1/rules.d/50-default.rules << 'EOF'
+polkit.addAdminRule(function(action, subject) {
+    return ["unix-group:wheel", "unix-group:sudo"];
+});
+EOF
+
+  # =====================================================
+  # Konfigurasi LightDM
+  # =====================================================
+  mkdir -p /.root/etc/lightdm
+  cat > /.root/etc/lightdm/lightdm.conf << 'EOF'
+[Seat:*]
+autologin-user=live
+autologin-user-timeout=0
+user-session=xfce
+greeter-session=lightdm-gtk-greeter
+EOF
+
+  # =====================================================
+  # Setup NetworkManager config
+  # =====================================================
+  mkdir -p /.root/etc/NetworkManager/conf.d
+  cat > /.root/etc/NetworkManager/conf.d/10-no-dns-update.conf << 'EOF'
+[main]
+dns=default
+EOF
+
+  # =====================================================
+  # Create /etc/machine-id
+  # =====================================================
+  if [ ! -f /.root/etc/machine-id ]; then
+    cat /proc/sys/kernel/random/uuid 2>/dev/null | tr -d '-' > /.root/etc/machine-id || \
+    echo "leakos-$(date +%Y%m%d)" > /.root/etc/machine-id
+  fi
+
+  # =====================================================
+  # Create /etc/resolv.conf (fallback)
+  # =====================================================
+  if [ ! -f /.root/etc/resolv.conf ]; then
+    cat > /.root/etc/resolv.conf << 'EOF'
+nameserver 8.8.8.8
+nameserver 8.8.4.4
+nameserver 1.1.1.1
+EOF
+  fi
+
+  # =====================================================
+  # /etc/bashrc global — PS1 otomatis beda warna root vs user
+  # =====================================================
+  cat > /.root/etc/bashrc << 'EOF'
+# /etc/bashrc - Global bash settings
+
+# PS1 berdasarkan user: merah untuk root, hijau untuk user biasa
+if [ "$EUID" -eq 0 ]; then
+    # Root — merah
+    PS1='\[\033[01;31m\]\u@\h\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ '
+else
+    # User biasa — hijau
+    PS1='\[\033[01;32m\]\u@\h\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ '
+fi
+
+# Color support for ls
+if [ -x /usr/bin/dircolors ]; then
+    test -r ~/.dircolors && eval "$(dircolors -b ~/.dircolors)" || eval "$(dircolors -b)"
+    alias ls='ls --color=auto'
+    alias grep='grep --color=auto'
+fi
+
+alias ll='ls -alF'
+alias la='ls -A'
+alias l='ls -CF'
+EOF
+
+  # /etc/profile — source /etc/bashrc
+  cat > /.root/etc/profile << 'EOF'
+# /etc/profile
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+if [ -f /etc/bashrc ]; then
+    . /etc/bashrc
+fi
+
+if [ -f ~/.bashrc ]; then
+    . ~/.bashrc
+fi
+EOF
+
+  log_msg "System files ready"
+}
+
+do_mount_root() {
+  log_msg "Mounting root filesystem (squashfs + overlay)"
+
+  # Modules sudah di-load di early boot sebelum udevadm trigger
+  # Hanya load yang belum / perlu parameter khusus
+  modprobe -q loop max_loop=64 || true
+  modprobe -q dm_mod     || true
+
+  # Buat loop devices jika belum ada
+  for i in 0 1 2 3 4 5 6 7; do
+    [ -b /dev/loop$i ] || mknod -m 660 /dev/loop$i b 7 $i 2>/dev/null
+  done
+
+  mkdir -p /.root /mnt /squash /cow/mod /cow/buffer
+
+  if ! find_boot_device; then
     return 1
+  fi
+
+  # Move atau remount ke /mnt
+  if mountpoint -q "$mnt_tmp" 2>/dev/null; then
+    mount --move "$mnt_tmp" /mnt || problem
+  else
+    mount -t auto "$device" /mnt || { log_msg "Mount $device failed"; problem; }
+  fi
+  log_msg "Boot media mounted at /mnt"
+
+  [ -f /mnt/boot/lfs.squashfs ] || { log_msg "lfs.squashfs missing!"; ls -la /mnt/boot/; problem; }
+
+  mount -t squashfs -o loop /mnt/boot/lfs.squashfs /squash || problem
+  log_msg "squashfs mounted at /squash"
+
+  mount -t tmpfs tmpfs /cow || problem
+  mkdir -p /cow/mod /cow/buffer
+
+  # Buat direktori di upperdir SEBELUM overlay di-mount
+  mkdir -p /cow/mod/dev /cow/mod/proc /cow/mod/sys /cow/mod/run
+  mkdir -p /cow/mod/etc /cow/mod/home /cow/mod/root
+  mkdir -p /cow/mod/mnt/changes /cow/mod/mnt/container
+  mkdir -p /cow/mod/dev/pts
+  mkdir -p /cow/mod/var/{log,lib,spool,tmp,run,cache}
+  mkdir -p /cow/mod/tmp
+  mkdir -p /cow/mod/media
+  mkdir -p /cow/mod/opt
+  mkdir -p /cow/mod/srv
+
+  mount -t overlay -o lowerdir=/squash,upperdir=/cow/mod,workdir=/cow/buffer overlay /.root || problem
+  log_msg "Overlay mounted at /.root"
+
+  # Pastikan direktori penting ada setelah overlay
+  mkdir -p /.root/etc /.root/home /.root/root /.root/var/log /.root/tmp /.root/run
+  mkdir -p /.root/var/lib /.root/var/spool /.root/var/cache
+  
+  # Copy resolv.conf jika ada
+  if [ -f /etc/resolv.conf ]; then
+    cp /etc/resolv.conf /.root/etc/ 2>/dev/null || true
+  fi
+
+  ensure_users
+  ensure_system
+
+  # Clean up any conflicting files
+  rm -f /.root/etc/nologin 2>/dev/null || true
+  rm -f /.root/run/nologin 2>/dev/null || true
+
+  mount --bind /cow/mod /.root/mnt/changes || true
+  mount --bind /mnt /.root/mnt/container   || true
+
+  log_msg "Binding pseudo-filesystems to new root..."
+  mount --move /dev  /.root/dev  || log_msg "WARNING: move /dev failed"
+  mount --move /proc /.root/proc || log_msg "WARNING: move /proc failed"
+  mount --move /sys  /.root/sys  || log_msg "WARNING: move /sys failed"
+  mount --move /run  /.root/run  || log_msg "WARNING: move /run failed"
+  
+  # Pastikan /dev/pts ada
+  mkdir -p /.root/dev/pts 2>/dev/null
+  mount -t devpts devpts /.root/dev/pts -o gid=5,mode=620 2>/dev/null || true
+
+  log_msg "Root filesystem prepared!"
 }
 
-# ============================================
-# Dump info debug rootfs
-# ============================================
+# ===================== MAIN =====================
 
-dump_rootfs_info() {
-    local ROOT_MNT="$1"
+log_msg "=== LeakOS Live ISO Init Starting ==="
 
-    log "=== DEBUG INFO ROOTFS ==="
-    log "Isi /sbin:"
-    ls -la "$ROOT_MNT/sbin/" 2>/dev/null | head -20
+# Mount basic filesystems
+mkdir -p /proc /sys /dev /run /tmp 2>/dev/null
 
-    log "Isi /lib (dynamic linker):"
-    ls "$ROOT_MNT/lib/"ld-* 2>/dev/null
-    ls "$ROOT_MNT/lib64/"ld-* 2>/dev/null
-    ls "$ROOT_MNT/usr/lib/"ld-* 2>/dev/null
+log_msg "Mounting pseudo-filesystems..."
+mount -t devtmpfs devtmpfs /dev 2>/dev/null || { log_msg "devtmpfs failed"; /bin/sh; }
+mount -t proc proc /proc || { log_msg "CRITICAL: proc mount failed!"; /bin/sh; }
+mount -t sysfs sysfs /sys 2>/dev/null || log_msg "sysfs mount failed (non-fatal)"
+mount -t tmpfs tmpfs /run 2>/dev/null || log_msg "tmpfs /run failed (non-fatal)"
+mkdir -p /dev/pts
+mount -t devpts devpts /dev/pts -o gid=5,mode=620 2>/dev/null || log_msg "devpts mount failed"
 
-    log "file /sbin/init:"
-    file "$ROOT_MNT/sbin/init" 2>/dev/null || log "(file command tidak tersedia)"
-
-    log "=== END DEBUG INFO ==="
-}
-
-# ============================================
-# Cleanup sebelum switch_root
-# ============================================
-
-cleanup() {
-    log "Cleaning up..."
-    killall udevd 2>/dev/null
-    killall systemd-udevd 2>/dev/null
-    umount /dev/pts 2>/dev/null
-    umount /tmp 2>/dev/null
-}
-
-# ============================================
-# MAIN
-# ============================================
-
-log "=== LeakOS Live Initramfs Starting ==="
-log "Kernel: $(uname -r)"
-
-mount_base
-parse_cmdline
-load_modules
-setup_loop_devices
-start_udev
-
-# Mount root filesystem
-ROOT_MNT=$(mount_root)
-if [ -z "$ROOT_MNT" ]; then
-    error "Gagal mount root filesystem!"
-    emergency_shell
+if [ ! -r /proc/cmdline ]; then
+  log_msg "WARNING: /proc/cmdline missing - remounting /proc"
+  umount /proc 2>/dev/null
+  mount -t proc proc /proc || { log_msg "Cannot remount /proc!"; /bin/sh; }
 fi
 
-# Dump info debug (selalu, untuk bantu diagnosa)
-dump_rootfs_info "$ROOT_MNT"
+cmdline=$(cat /proc/cmdline 2>/dev/null || echo "")
+log_msg "Kernel cmdline: $cmdline"
 
-# Cari init
-ROOT_INIT=$(find_root_init "$ROOT_MNT")
-if [ -z "$ROOT_INIT" ]; then
-    error "Tidak ada init yang valid di $ROOT_MNT!"
-    error "Isi /sbin:"
-    ls -la "$ROOT_MNT/sbin" 2>/dev/null
-    emergency_shell
+for param in $cmdline; do
+  case $param in
+    debug)        DEBUG=true ;;
+    rootdelay=*)  rootdelay=${param#rootdelay=} ;;
+  esac
+done
+
+# Start udev — daemon DULU, baru trigger
+log_msg "Starting udev..."
+UDEVD=""
+for p in /usr/bin/udevd /usr/sbin/udevd /sbin/udevd /lib/udev/udevd /usr/lib/udev/udevd /usr/lib/systemd/systemd-udevd; do
+  [ -x "$p" ] && UDEVD="$p" && break
+done
+
+if [ -z "$UDEVD" ]; then
+  log_msg "WARNING: udevd not found, using mdev fallback"
+  mdev -s 2>/dev/null || true
+else
+  $UDEVD --daemon --resolve-names=never 2>/dev/null
+  sleep 1
+
+  # Load storage & filesystem modules SEBELUM trigger
+  # agar udev bisa detect device dengan benar
+  log_msg "Loading early modules (storage, fs, net)..."
+  modprobe -q loop       || true
+  modprobe -q squashfs   || true
+  modprobe -q overlay    || true
+  modprobe -q iso9660    || true
+  modprobe -q vfat       || true
+  modprobe -q exfat      || true
+  modprobe -q usb-storage || true
+  modprobe -q sr_mod     || true
+  modprobe -q xhci_hcd   || true
+  modprobe -q ehci_hcd   || true
+  modprobe -q uhci_hcd   || true
+
+  # Network modules — WAJIB sebelum udevadm trigger
+  # supaya udev bisa rename/detect interface dengan benar
+  log_msg "Loading network modules early..."
+  modprobe -q e1000      || true
+  modprobe -q e1000e     || true
+  modprobe -q pcnet32    || true
+  modprobe -q virtio_net || true
+  modprobe -q vmxnet3    || true
+  # WiFi
+  modprobe -q mac80211   || true
+  modprobe -q cfg80211   || true
+  modprobe -q 8188eu    || true
+  modprobe -q rtl8192ce  || true
+  modprobe -q rtl8xxxu   || true
+  modprobe -q ath9k      || true
+  modprobe -q iwlwifi    || true
+  modprobe -q brcmfmac   || true
+  # GPU / display
+  modprobe -q vboxvideo  || true
+  modprobe -q virtio_gpu || true
+  modprobe -q drm        || true
+
+  udevadm trigger --action=add 2>/dev/null || true
+  udevadm settle --timeout=30 2>/dev/null || true
+  log_msg "udev ready"
 fi
 
-cleanup
+[ -n "$rootdelay" ] && { log_msg "rootdelay ${rootdelay}s"; sleep "$rootdelay"; }
 
-log "=== Switching to new root, init: $ROOT_INIT ==="
+do_mount_root || problem
 
-exec switch_root "$ROOT_MNT" "$ROOT_INIT"
+log_msg "Stopping udev..."
+killall -q udevd 2>/dev/null || killall -q systemd-udevd 2>/dev/null || true
 
-# Jika sampai sini
-error "switch_root GAGAL!"
-emergency_shell
+# Cari init yang valid di new root
+INIT_PATH=$(find_init)
+if [ -z "$INIT_PATH" ]; then
+  log_msg "FATAL: No valid init found in /.root!"
+  log_msg "Contents of /.root/sbin:"
+  ls -la /.root/sbin/ 2>/dev/null || true
+  log_msg "Contents of /.root/usr/sbin:"
+  ls -la /.root/usr/sbin/ 2>/dev/null || true
+  log_msg "Contents of /.root/usr/lib/systemd:"
+  ls -la /.root/usr/lib/systemd/ 2>/dev/null || true
+  problem
+fi
+
+log_msg "Switching to new root with init: $INIT_PATH"
+
+# Final cleanup before switch_root
+umount /dev/pts 2>/dev/null || true
+
+exec switch_root /.root "$INIT_PATH" "$@"
+
+log_msg "FATAL: switch_root failed! INIT_PATH=$INIT_PATH"
+ls -la /.root/sbin /.root/usr/sbin 2>/dev/null || true
+problem
