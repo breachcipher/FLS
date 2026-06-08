@@ -46,7 +46,7 @@ if   [ -x /usr/bin/udevadm ] ; then binfiles="$binfiles"
 elif [ -x /sbin/udevadm ]    ; then binfiles="$binfiles"
 fi
 
-sbinfiles="modprobe blkid switch_root udevadm"
+sbinfiles="modprobe blkid switch_root"
 
 # udevd — cari di semua lokasi umum
 for f in udevd udevadm; do
@@ -127,17 +127,36 @@ if [ -n "$KERNEL_VERSION" ] ; then
   fi
 fi
 
+# Helper: parse ldd output, ambil path aktual library
+# Format ldd:  "  libname.so => /path/to/lib.so (0x...)"
+#          atau "  /lib64/ld-linux.so.2 (0x...)"  <- path absolut
+parse_ldd() {
+  ldd "$1" 2>/dev/null | while IFS= read -r line; do
+    line=$(echo "$line" | sed 's/^\s*//')
+    case "$line" in
+      ""| *linux-vdso*|*linux-gate*) continue ;;
+    esac
+    if echo "$line" | grep -q '=>'; then
+      # Format: libname => /path (addr) — ambil path
+      echo "$line" | sed 's/.*=> //' | cut -d' ' -f1
+    else
+      # Format: /path/absolut (addr)
+      echo "$line" | cut -d' ' -f1
+    fi
+  done
+}
+
 # Install binaries dari /usr/bin atau /bin
 echo "Installing binaries..."
 for f in $binfiles ; do
   if [ -x /usr/bin/$f ]; then
-    ldd /usr/bin/$f 2>/dev/null | sed "s/\t//" | cut -d " " -f1 >> $unsorted
+    parse_ldd /usr/bin/$f >> $unsorted
     copy $f bin
   elif [ -x /bin/$f ]; then
-    ldd /bin/$f 2>/dev/null | sed "s/\t//" | cut -d " " -f1 >> $unsorted
+    parse_ldd /bin/$f >> $unsorted
     copy $f bin
   elif [ -x /usr/local/bin/$f ]; then
-    ldd /usr/local/bin/$f 2>/dev/null | sed "s/\t//" | cut -d " " -f1 >> $unsorted
+    parse_ldd /usr/local/bin/$f >> $unsorted
     copy $f bin
   else
     echo "Warning: $f not found in /usr/bin or /bin"
@@ -148,13 +167,13 @@ done
 echo "Installing sbinaries..."
 for f in $sbinfiles ; do
   if [ -x /usr/sbin/$f ]; then
-    ldd /usr/sbin/$f 2>/dev/null | sed "s/\t//" | cut -d " " -f1 >> $unsorted
+    parse_ldd /usr/sbin/$f >> $unsorted
     copy $f sbin
   elif [ -x /sbin/$f ]; then
-    ldd /sbin/$f 2>/dev/null | sed "s/\t//" | cut -d " " -f1 >> $unsorted
+    parse_ldd /sbin/$f >> $unsorted
     copy $f sbin
   elif [ -x /usr/local/sbin/$f ]; then
-    ldd /usr/local/sbin/$f 2>/dev/null | sed "s/\t//" | cut -d " " -f1 >> $unsorted
+    parse_ldd /usr/local/sbin/$f >> $unsorted
     copy $f sbin
   else
     echo "Warning: $f not found in /usr/sbin or /sbin"
@@ -171,7 +190,7 @@ for udevd_path in \
   /sbin/udevd
 do
   if [ -x "$udevd_path" ]; then
-    ldd "$udevd_path" 2>/dev/null | sed "s/\t//" | cut -d " " -f1 >> $unsorted
+    parse_ldd "$udevd_path" >> $unsorted
     case "$udevd_path" in
       /usr/lib/udev/*)    dest="$WDIR/usr/lib/udev/" ;;
       /lib/udev/*)        dest="$WDIR/usr/lib/udev/" ;;
@@ -196,15 +215,29 @@ fi
 
 # =====================================================
 # Install shared libraries
-# PENTING: ld-linux TIDAK di-skip — ini penyebab error -8
+# ldd bisa output nama file ATAU path absolut — handle keduanya
 # =====================================================
 echo "Installing shared libraries..."
-sort $unsorted | uniq | while read library ; do
-  case "$library" in
+sort $unsorted | uniq | while read entry ; do
+  # entry bisa berupa "libc.so.6" atau "/lib64/ld-linux-x86-64.so.2"
+  case "$entry" in
     linux-vdso.so*)     continue ;;
     linux-gate.so*)     continue ;;
     libsystemd-shared*) continue ;;
   esac
+
+  # Kalau path absolut, ambil basename sebagai nama file tujuan
+  if echo "$entry" | grep -q '^/'; then
+    lib_name=$(basename "$entry")
+    # Coba dari path absolut dulu
+    if [ -f "$entry" ]; then
+      cp "$entry" "$WDIR/usr/lib/" 2>/dev/null || true
+      echo "  Copied library: $lib_name (dari path absolut)"
+      continue
+    fi
+  else
+    lib_name="$entry"
+  fi
 
   lib_file=""
   for libdir in \
@@ -213,21 +246,19 @@ sort $unsorted | uniq | while read library ; do
     /usr/lib64 \
     /lib64 \
     /usr/lib/x86_64-linux-gnu \
-    /lib/x86_64-linux-gnu \
-    /usr/lib/i386-linux-gnu \
-    /lib/i386-linux-gnu
+    /lib/x86_64-linux-gnu
   do
-    if [ -f "$libdir/$library" ]; then
-      lib_file="$libdir/$library"
+    if [ -f "$libdir/$lib_name" ]; then
+      lib_file="$libdir/$lib_name"
       break
     fi
   done
 
   if [ -n "$lib_file" ]; then
     cp "$lib_file" "$WDIR/usr/lib/" 2>/dev/null || true
-    echo "  Copied library: $library"
+    echo "  Copied library: $lib_name"
   else
-    echo "  Warning: library not found: $library"
+    echo "  Warning: library not found: $lib_name"
   fi
 done
 
@@ -271,8 +302,8 @@ ln -sf /usr/lib/ld-linux-x86-64.so.2 "$WDIR/usr/lib/x86_64-linux-gnu/ld-linux-x8
 
 # =====================================================
 # Verifikasi bahwa sh/bash benar-benar punya semua deps
-# Ini catch dini sebelum boot — lebih baik gagal sekarang
-# daripada kernel panic di hardware
+# ldd bisa output nama file (libc.so.6) atau path absolut
+# (/lib64/ld-linux-x86-64.so.2) — keduanya harus di-handle
 # =====================================================
 echo ""
 echo "=== Verifying interpreter chain ==="
@@ -284,26 +315,57 @@ for interp in sh bash; do
     continue
   fi
 
-  # Cek semua library yang dibutuhkan tersedia di WDIR
   missing=0
-  while IFS= read -r lib; do
-    lib=$(echo "$lib" | sed 's/^\s*//' | cut -d' ' -f1)
-    case "$lib" in
-      linux-vdso*|linux-gate*|"") continue ;;
+  while IFS= read -r line; do
+    # ldd output format bervariasi:
+    #   libc.so.6 => /lib64/libc.so.6 (0x...)
+    #   /lib64/ld-linux-x86-64.so.2 (0x...)    <- path absolut, tidak ada =>
+    line=$(echo "$line" | sed 's/^\s*//')
+
+    # Skip baris kosong dan vdso
+    case "$line" in
+      ""| *linux-vdso*|*linux-gate*) continue ;;
     esac
-    if [ ! -f "$WDIR/usr/lib/$lib" ] && [ ! -L "$WDIR/usr/lib/$lib" ]; then
-      echo "  MISSING dep for $interp: $lib"
-      # Coba copy sekarang
-      for libdir in /usr/lib /lib /lib64 /usr/lib64 /usr/lib/x86_64-linux-gnu /lib/x86_64-linux-gnu; do
-        if [ -f "$libdir/$lib" ]; then
-          cp "$libdir/$lib" "$WDIR/usr/lib/"
-          echo "    -> Auto-fixed: copied $lib from $libdir"
-          break
-        fi
-      done
-      missing=$((missing + 1))
+
+    # Ambil path aktual: kalau ada "=>" ambil bagian kanan, kalau tidak ada ambil field pertama
+    if echo "$line" | grep -q '=>'; then
+      lib_path=$(echo "$line" | sed 's/.*=> //' | cut -d' ' -f1)
+      lib_name=$(echo "$line" | cut -d' ' -f1)
+    else
+      lib_path=$(echo "$line" | cut -d' ' -f1)
+      lib_name=$(basename "$lib_path")
     fi
-  done < <(ldd "$bin_path" 2>/dev/null | sed 's/\t//' | cut -d' ' -f1)
+
+    # Skip "not found" atau path kosong
+    [ -z "$lib_path" ] && continue
+    [ "$lib_path" = "not" ] && continue
+
+    lib_name=$(basename "$lib_path")
+
+    # Cek apakah sudah ada di WDIR (cek filename-nya)
+    if [ ! -f "$WDIR/usr/lib/$lib_name" ] && [ ! -L "$WDIR/usr/lib/$lib_name" ]; then
+      echo "  MISSING dep for $interp: $lib_name (dari: $lib_path)"
+
+      # Auto-fix: coba copy dari path absolut dulu, lalu fallback ke libdir scan
+      fixed=0
+      if [ -f "$lib_path" ]; then
+        cp "$lib_path" "$WDIR/usr/lib/"
+        echo "    -> Auto-fixed: copied from $lib_path"
+        fixed=1
+      else
+        for libdir in /usr/lib /lib /lib64 /usr/lib64 /usr/lib/x86_64-linux-gnu /lib/x86_64-linux-gnu; do
+          if [ -f "$libdir/$lib_name" ]; then
+            cp "$libdir/$lib_name" "$WDIR/usr/lib/"
+            echo "    -> Auto-fixed: copied $lib_name from $libdir"
+            fixed=1
+            break
+          fi
+        done
+      fi
+
+      [ $fixed -eq 0 ] && missing=$((missing + 1))
+    fi
+  done < <(ldd "$bin_path" 2>/dev/null)
 
   if [ $missing -eq 0 ]; then
     echo "  OK: $interp — semua dependencies tersedia"
