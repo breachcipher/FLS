@@ -1,12 +1,11 @@
 #!/bin/sh
 # LeakOS Live Initramfs Init Script
-# Fixed v5 - Complete rewrite with better error handling
+# Fixed v4 - bind mount, no double mount, robust init search
 
 export PATH=/usr/bin:/usr/sbin:/bin:/sbin
 export HOME=/
 
 OVERRIDE_INIT=""
-DEBUG_MODE=0
 
 # ============================================
 # Fungsi utilitas
@@ -33,18 +32,12 @@ emergency_shell() {
     echo "  EMERGENCY SHELL - LeakOS Debug"
     echo "========================================"
     echo "Tips debug:"
-    echo "  lsblk"
-    echo "  blkid"
-    echo "  mount"
-    echo "  dmesg | tail -50"
-    echo "  ls -la /bootmnt/boot/"
-    echo "  cat /proc/modules"
-    echo "  ls -la /dev/loop*"
+    echo "  mount | grep newroot"
+    echo "  ls /newroot/sbin/ /newroot/bin/"
+    echo "  file /newroot/sbin/init"
+    echo "  ls /newroot/lib/ld-* /newroot/lib64/ld-*"
+    echo "  exec switch_root /newroot /sbin/init"
     echo "========================================"
-    echo ""
-    
-    # Start shell with proper environment
-    export PS1='sh-debug# '
     exec /bin/sh
 }
 
@@ -55,34 +48,25 @@ emergency_shell() {
 mount_base() {
     log "Mounting base filesystems..."
 
-    # Mount /proc first
-    mount -t proc proc /proc 2>/dev/null || error "proc failed"
-    
-    # Mount /sys
-    mount -t sysfs sysfs /sys 2>/dev/null || error "sysfs failed"
-    
-    # Mount /dev
-    mount -t devtmpfs devtmpfs /dev 2>/dev/null || {
-        mount -t tmpfs tmpfs /dev 2>/dev/null || error "devtmpfs failed"
-    }
-    
-    # Mount /run
-    mount -t tmpfs tmpfs /run 2>/dev/null || warn "tmpfs /run failed"
-    
-    # Mount /tmp
-    mount -t tmpfs tmpfs /tmp 2>/dev/null || warn "tmpfs /tmp failed"
+    mount -t devtmpfs devtmpfs /dev 2>/dev/null || \
+        mount -t tmpfs tmpfs /dev 2>/dev/null   || \
+        error "devtmpfs failed"
 
-    # Create /dev/pts
+    mount -t proc proc /proc       2>/dev/null || error "proc failed"
+    mount -t sysfs sysfs /sys      2>/dev/null || error "sysfs failed"
+    mount -t tmpfs tmpfs /run      2>/dev/null || warn "tmpfs /run failed"
+    mount -t tmpfs tmpfs /tmp      2>/dev/null || warn "tmpfs /tmp failed"
+
     mkdir -p /dev/pts 2>/dev/null
     mount -t devpts devpts /dev/pts -o gid=5,mode=620 2>/dev/null || warn "devpts failed"
 
-    # Create essential device nodes
-    [ -c /dev/null ]    || mknod -m 666 /dev/null    c 1 3 2>/dev/null
-    [ -c /dev/console ] || mknod -m 600 /dev/console c 5 1 2>/dev/null
-    [ -c /dev/tty ]     || mknod -m 666 /dev/tty     c 5 0 2>/dev/null
-    [ -c /dev/zero ]    || mknod -m 666 /dev/zero    c 1 5 2>/dev/null
-    [ -c /dev/urandom ] || mknod -m 666 /dev/urandom c 1 9 2>/dev/null
-    [ -c /dev/random ]  || mknod -m 666 /dev/random  c 1 8 2>/dev/null
+    [ -c /dev/null ]    || mknod -m 666 /dev/null    c 1 3
+    [ -c /dev/console ] || mknod -m 600 /dev/console c 5 1
+    [ -c /dev/tty ]     || mknod -m 666 /dev/tty     c 5 0
+    [ -c /dev/tty1 ]    || mknod -m 600 /dev/tty1    c 4 1
+    [ -c /dev/tty2 ]    || mknod -m 600 /dev/tty2    c 4 2
+    [ -c /dev/urandom ] || mknod -m 666 /dev/urandom c 1 9
+    [ -c /dev/random ]  || mknod -m 666 /dev/random  c 1 8
 
     log "Base filesystems ready"
 }
@@ -94,32 +78,20 @@ mount_base() {
 load_modules() {
     log "Loading kernel modules..."
 
-    # First, ensure /proc is mounted
-    [ -d /proc ] || mkdir -p /proc
-    
-    # Load essential modules
-    MODULES="squashfs overlay loop"
-    
-    for mod in $MODULES; do
-        if modprobe "$mod" 2>/dev/null; then
-            log "  Loaded: $mod"
-        else
-            warn "  Failed to load $mod"
-            # Try with full path
-            if [ -f "/lib/modules/$(uname -r)/kernel/fs/$mod/$mod.ko" ]; then
-                insmod "/lib/modules/$(uname -r)/kernel/fs/$mod/$mod.ko" 2>/dev/null && log "  Loaded $mod via insmod"
-            fi
-        fi
+    for mod in squashfs overlay loop; do
+        modprobe -q "$mod" 2>/dev/null && log "  Loaded: $mod" || warn "  Failed: $mod"
     done
 
-    # Load filesystem modules
-    for mod in vfat exfat iso9660 ext4 ext3 ext2; do
-        modprobe "$mod" 2>/dev/null
+    for mod in vfat exfat iso9660 ext4 ext3 ext2 xfs btrfs; do
+        modprobe -q "$mod" 2>/dev/null
     done
 
-    # Load storage drivers
-    for mod in usb_storage sr_mod ahci nvme virtio_blk; do
-        modprobe "$mod" 2>/dev/null
+    for mod in usb_storage sr_mod ahci nvme virtio_blk mmc_block; do
+        modprobe -q "$mod" 2>/dev/null
+    done
+
+    for mod in xhci_hcd ehci_hcd uhci_hcd; do
+        modprobe -q "$mod" 2>/dev/null
     done
 
     log "Modules loaded"
@@ -131,57 +103,33 @@ load_modules() {
 
 setup_loop_devices() {
     log "Setting up loop devices..."
-    
-    # Create loop control if not exists
-    [ -c /dev/loop-control ] || mknod -m 660 /dev/loop-control c 10 237 2>/dev/null
-    
-    # Create loop devices
     for i in 0 1 2 3 4 5 6 7; do
-        if [ ! -b "/dev/loop$i" ]; then
-            mknod -m 660 "/dev/loop$i" b 7 "$i" 2>/dev/null
-        fi
+        [ -b "/dev/loop$i" ] || mknod -m 660 "/dev/loop$i" b 7 "$i" 2>/dev/null
     done
-    
-    log "Loop devices ready"
 }
 
 # ============================================
-# Start udev (optional, can be skipped)
+# Start udev
 # ============================================
 
 start_udev() {
-    log "Starting udev (optional)..."
-    
-    # Skip udev if not available or in debug mode
-    if [ "$DEBUG_MODE" -eq 1 ]; then
-        warn "Debug mode: skipping udev"
-        return 0
-    fi
+    log "Starting udev..."
 
-    # Find udevd
     UDEVD=""
-    for p in /sbin/udevd /usr/sbin/udevd /lib/systemd/systemd-udevd /usr/lib/systemd/systemd-udevd; do
-        if [ -x "$p" ]; then
-            UDEVD="$p"
-            break
-        fi
+    for p in /usr/lib/systemd/systemd-udevd /usr/lib/udev/udevd /sbin/udevd /usr/sbin/udevd; do
+        [ -x "$p" ] && UDEVD="$p" && break
     done
 
     if [ -z "$UDEVD" ]; then
-        warn "udevd not found, continuing without udev"
-        return 0
+        warn "udevd not found, skipping"
+        return
     fi
 
-    # Start udevd
-    $UDEVD --daemon 2>/dev/null
-    
-    # Trigger events
-    if command -v udevadm >/dev/null 2>&1; then
-        udevadm trigger --action=add 2>/dev/null
-        udevadm settle --timeout=10 2>/dev/null
-    fi
+    $UDEVD --daemon --resolve-names=never 2>/dev/null
+    udevadm trigger --action=add 2>/dev/null
+    udevadm settle --timeout=30 2>/dev/null
 
-    log "udev started"
+    log "udev ready"
 }
 
 # ============================================
@@ -194,7 +142,6 @@ parse_cmdline() {
     for param in $(cat /proc/cmdline); do
         case "$param" in
             debug)
-                DEBUG_MODE=1
                 log "Debug mode enabled"
                 set -x
                 ;;
@@ -207,98 +154,66 @@ parse_cmdline() {
                 OVERRIDE_INIT="${param#init=}"
                 log "Init override: $OVERRIDE_INIT"
                 ;;
-            single|s|1)
-                log "Single user mode"
-                OVERRIDE_INIT="/bin/sh"
-                ;;
         esac
     done
 }
 
 # ============================================
-# Mount boot media
+# Cari boot media dengan lfs.squashfs
 # ============================================
 
-mount_boot_media() {
+find_boot_media() {
     local BOOT_MNT="/bootmnt"
-    
-    log "Mounting boot media..."
-    mkdir -p "$BOOT_MNT"
-    
-    # List all block devices
-    log "Available block devices:"
-    ls -la /dev/sd* /dev/hd* /dev/nvme* /dev/sr* 2>/dev/null || echo "  No devices found"
-    
-    # Try each device
-    for device in /dev/sr0 /dev/sr1 /dev/cdrom /dev/dvd /dev/sda1 /dev/sda2 /dev/sdb1 /dev/sdb2 /dev/hda1 /dev/hda2; do
-        [ -b "$device" ] || continue
-        
-        log "Trying device: $device"
-        
-        # Try iso9660 first (for optical media)
-        if mount -t iso9660 -o ro "$device" "$BOOT_MNT" 2>/dev/null; then
-            if [ -f "$BOOT_MNT/boot/lfs.squashfs" ] || [ -f "$BOOT_MNT/lfs.squashfs" ]; then
-                log "Found boot media on $device (iso9660)"
-                echo "$device"
-                return 0
-            fi
-            umount "$BOOT_MNT" 2>/dev/null
-        fi
-        
-        # Try vfat
-        if mount -t vfat -o ro "$device" "$BOOT_MNT" 2>/dev/null; then
-            if [ -f "$BOOT_MNT/boot/lfs.squashfs" ] || [ -f "$BOOT_MNT/lfs.squashfs" ]; then
-                log "Found boot media on $device (vfat)"
-                echo "$device"
-                return 0
-            fi
-            umount "$BOOT_MNT" 2>/dev/null
-        fi
-        
-        # Try ext4
-        if mount -t ext4 -o ro "$device" "$BOOT_MNT" 2>/dev/null; then
-            if [ -f "$BOOT_MNT/boot/lfs.squashfs" ] || [ -f "$BOOT_MNT/lfs.squashfs" ]; then
-                log "Found boot media on $device (ext4)"
-                echo "$device"
-                return 0
-            fi
-            umount "$BOOT_MNT" 2>/dev/null
-        fi
-    done
-    
-    # Try scanning all partitions
-    log "Scanning all partitions..."
-    for part in $(ls /dev/sd* /dev/hd* /dev/nvme* 2>/dev/null); do
-        [ -b "$part" ] || continue
-        
-        # Try to mount
-        for fstype in iso9660 vfat exfat ext4 ext3 ext2 btrfs auto; do
-            if mount -t "$fstype" -o ro "$part" "$BOOT_MNT" 2>/dev/null; then
-                # Check for squashfs in various locations
-                if [ -f "$BOOT_MNT/boot/lfs.squashfs" ]; then
-                    log "Found lfs.squashfs at $part:/boot/lfs.squashfs"
-                    echo "$part"
-                    return 0
-                elif [ -f "$BOOT_MNT/lfs.squashfs" ]; then
-                    log "Found lfs.squashfs at $part:/lfs.squashfs"
-                    echo "$part"
-                    return 0
-                elif [ -f "$BOOT_MNT/boot/rootfs.squashfs" ]; then
-                    log "Found rootfs.squashfs at $part:/boot/rootfs.squashfs"
-                    echo "$part"
-                    return 0
-                fi
-                umount "$BOOT_MNT" 2>/dev/null
+    local timeout=60
+    local elapsed=0
+
+    log "Searching for boot media (timeout: ${timeout}s)..."
+    mkdir -p "$BOOT_MNT" 2>/dev/null
+
+    while [ $elapsed -lt $timeout ]; do
+        for dev in $(ls /sys/block/ 2>/dev/null); do
+            case "$dev" in
+                loop*|ram*|dm-*) continue ;;
+            esac
+
+            for part in /dev/${dev}p[0-9]* /dev/${dev}[0-9]*; do
+                [ -b "$part" ] || continue
+                for fstype in iso9660 vfat exfat ext4 ext3 ext2; do
+                    if mount -t "$fstype" -o ro "$part" "$BOOT_MNT" 2>/dev/null; then
+                        if [ -f "$BOOT_MNT/boot/lfs.squashfs" ]; then
+                            log "Found: $part (partition)"
+                            echo "$part"
+                            return 0
+                        fi
+                        umount "$BOOT_MNT" 2>/dev/null
+                    fi
+                done
+            done
+
+            if [ -b "/dev/$dev" ]; then
+                for fstype in iso9660 udf; do
+                    if mount -t "$fstype" -o ro "/dev/$dev" "$BOOT_MNT" 2>/dev/null; then
+                        if [ -f "$BOOT_MNT/boot/lfs.squashfs" ]; then
+                            log "Found: /dev/$dev (whole disk)"
+                            echo "/dev/$dev"
+                            return 0
+                        fi
+                        umount "$BOOT_MNT" 2>/dev/null
+                    fi
+                done
             fi
         done
+
+        sleep 2
+        elapsed=$((elapsed + 2))
+        [ $((elapsed % 10)) -eq 0 ] && log "Still searching... (${elapsed}s)"
     done
-    
-    error "No boot media with squashfs found"
+
     return 1
 }
 
 # ============================================
-# Mount root filesystem
+# Mount root filesystem (squashfs + overlay)
 # ============================================
 
 mount_root() {
@@ -306,245 +221,247 @@ mount_root() {
     local SQUASH_MNT="/squashfs"
     local ROOT_MNT="/newroot"
     local COW_DIR="/cow"
-    
-    log "========================================="
-    log "Mounting root filesystem"
-    log "========================================="
-    
-    # Create directories
+    local UPPER_DIR="$COW_DIR/upper"
+    local WORK_DIR="$COW_DIR/work"
+
+    log "Mounting root filesystem..."
     mkdir -p "$BOOT_MNT" "$SQUASH_MNT" "$ROOT_MNT" "$COW_DIR"
-    
-    # Find and mount boot media
-    BOOT_DEV=$(mount_boot_media)
+
+    # Cari boot media
+    BOOT_DEV=$(find_boot_media)
     if [ -z "$BOOT_DEV" ]; then
-        error "Failed to find boot media"
+        error "Boot media tidak ditemukan!"
+        lsblk 2>/dev/null || cat /proc/partitions
         return 1
     fi
-    
-    log "Boot device mounted at $BOOT_MNT"
-    
-    # List boot media contents
-    log "Boot media contents:"
-    ls -la "$BOOT_MNT/" 2>/dev/null | head -10
-    ls -la "$BOOT_MNT/boot/" 2>/dev/null | head -10
-    
-    # Find squashfs file
-    SQUASHFS_FILE=""
-    if [ -f "$BOOT_MNT/boot/lfs.squashfs" ]; then
-        SQUASHFS_FILE="$BOOT_MNT/boot/lfs.squashfs"
-    elif [ -f "$BOOT_MNT/lfs.squashfs" ]; then
-        SQUASHFS_FILE="$BOOT_MNT/lfs.squashfs"
-    elif [ -f "$BOOT_MNT/rootfs.squashfs" ]; then
-        SQUASHFS_FILE="$BOOT_MNT/rootfs.squashfs"
-    elif [ -f "$BOOT_MNT/boot/rootfs.squashfs" ]; then
-        SQUASHFS_FILE="$BOOT_MNT/boot/rootfs.squashfs"
+
+    log "Boot device: $BOOT_DEV"
+
+    # find_boot_media sudah mount ke BOOT_MNT — jangan double mount
+    if mountpoint -q "$BOOT_MNT" 2>/dev/null; then
+        log "Boot media sudah termount di $BOOT_MNT, skip"
     else
-        error "No squashfs file found"
-        log "Searching for any .squashfs file:"
-        find "$BOOT_MNT" -name "*.squashfs" 2>/dev/null
-        return 1
-    fi
-    
-    log "Found squashfs: $SQUASHFS_FILE"
-    ls -lh "$SQUASHFS_FILE"
-    
-    # Mount squashfs
-    log "Mounting squashfs..."
-    if ! mount -t squashfs -o ro,loop "$SQUASHFS_FILE" "$SQUASH_MNT" 2>&1; then
-        error "Failed to mount squashfs"
-        log "Trying with explicit loop device..."
-        
-        # Try to find a free loop device
-        for i in 0 1 2 3 4 5 6 7; do
-            if losetup /dev/loop$i "$SQUASHFS_FILE" 2>/dev/null; then
-                log "Set up /dev/loop$i for squashfs"
-                if mount -t squashfs -o ro "/dev/loop$i" "$SQUASH_MNT" 2>/dev/null; then
-                    log "Squashfs mounted via /dev/loop$i"
-                    break
-                fi
-            fi
-        done
-        
-        # Check if mounted
-        if ! mountpoint -q "$SQUASH_MNT"; then
-            error "Cannot mount squashfs"
+        if ! mount -t auto -o ro "$BOOT_DEV" "$BOOT_MNT"; then
+            error "Gagal mount $BOOT_DEV"
             return 1
         fi
     fi
-    
-    log "Squashfs mounted at $SQUASH_MNT"
-    
-    # Verify squashfs content
-    if [ -z "$(ls -A $SQUASH_MNT 2>/dev/null)" ]; then
-        error "Squashfs is empty"
+
+    # Verifikasi squashfs
+    if [ ! -f "$BOOT_MNT/boot/lfs.squashfs" ]; then
+        error "lfs.squashfs tidak ada di $BOOT_MNT/boot/"
+        ls -la "$BOOT_MNT/boot/" 2>/dev/null
         return 1
     fi
-    
-    log "Squashfs root contents: $(ls $SQUASH_MNT | head -5)"
-    
-    # Setup writable overlay
-    log "Setting up overlay..."
+
+    log "lfs.squashfs ditemukan"
+
+    # Mount squashfs
+    if ! mount -t squashfs -o loop "$BOOT_MNT/boot/lfs.squashfs" "$SQUASH_MNT"; then
+        error "Gagal mount squashfs"
+        return 1
+    fi
+
+    log "Squashfs mounted di $SQUASH_MNT"
+
+    # Verifikasi squashfs tidak kosong
+    if [ -z "$(ls -A "$SQUASH_MNT" 2>/dev/null)" ]; then
+        error "Squashfs kosong!"
+        return 1
+    fi
+
+    # Mount tmpfs untuk overlay
     if ! mount -t tmpfs -o mode=755 tmpfs "$COW_DIR"; then
-        error "Failed to mount tmpfs for overlay"
+        error "Gagal mount tmpfs untuk overlay"
         return 1
     fi
-    
-    mkdir -p "$COW_DIR/upper" "$COW_DIR/work"
-    
+
+    mkdir -p "$UPPER_DIR" "$WORK_DIR"
+
     # Mount overlay
-    log "Mounting overlay at $ROOT_MNT"
     if ! mount -t overlay overlay \
-        -o lowerdir="$SQUASH_MNT",upperdir="$COW_DIR/upper",workdir="$COW_DIR/work" \
+        -o lowerdir="$SQUASH_MNT",upperdir="$UPPER_DIR",workdir="$WORK_DIR" \
         "$ROOT_MNT"; then
-        error "Failed to mount overlay"
+        error "Gagal mount overlay"
         return 1
     fi
-    
-    log "Overlay mounted at $ROOT_MNT"
-    
-    # Verify overlay
-    if ! mountpoint -q "$ROOT_MNT"; then
-        error "Overlay mount verification failed"
-        return 1
-    fi
-    
-    # Create necessary directories in new root
-    mkdir -p "$ROOT_MNT"/{dev,proc,sys,run,tmp,etc,root,home,var,usr,bin,sbin,lib,lib64,mnt,media,opt,srv}
-    
-    # Move mounts to new root
-    log "Moving filesystems to new root..."
-    
-    # Move /dev
-    mount --move /dev "$ROOT_MNT/dev" 2>/dev/null || {
-        warn "Cannot move /dev, mounting new"
-        mount -t devtmpfs devtmpfs "$ROOT_MNT/dev" 2>/dev/null
-        # Copy existing device nodes
-        cp -a /dev/* "$ROOT_MNT/dev/" 2>/dev/null
-    }
-    
-    # Move /proc
-    mount --move /proc "$ROOT_MNT/proc" 2>/dev/null || {
-        warn "Cannot move /proc, mounting new"
-        mount -t proc proc "$ROOT_MNT/proc" 2>/dev/null
-    }
-    
-    # Move /sys
-    mount --move /sys "$ROOT_MNT/sys" 2>/dev/null || {
-        warn "Cannot move /sys, mounting new"
-        mount -t sysfs sysfs "$ROOT_MNT/sys" 2>/dev/null
-    }
-    
-    # Move /run
-    mount --move /run "$ROOT_MNT/run" 2>/dev/null || {
-        warn "Cannot move /run, mounting new"
-        mount -t tmpfs tmpfs "$ROOT_MNT/run" 2>/dev/null
-    }
-    
-    # Additional mounts
-    mkdir -p "$ROOT_MNT/dev/pts"
-    mount -t devpts devpts "$ROOT_MNT/dev/pts" -o gid=5,mode=620 2>/dev/null
-    
-    mount -t tmpfs tmpfs "$ROOT_MNT/tmp" 2>/dev/null
-    
-    # Bind mount boot media
-    mkdir -p "$ROOT_MNT/mnt/bootmedia"
-    mount --bind "$BOOT_MNT" "$ROOT_MNT/mnt/bootmedia" 2>/dev/null
-    
-    # Create essential device nodes in new root
-    [ -c "$ROOT_MNT/dev/null" ] || mknod -m 666 "$ROOT_MNT/dev/null" c 1 3 2>/dev/null
-    [ -c "$ROOT_MNT/dev/zero" ] || mknod -m 666 "$ROOT_MNT/dev/zero" c 1 5 2>/dev/null
-    [ -c "$ROOT_MNT/dev/console" ] || mknod -m 600 "$ROOT_MNT/dev/console" c 5 1 2>/dev/null
-    
-    log "Root filesystem ready at $ROOT_MNT"
-    
-    # Show mount status
-    log "Mounts in new root:"
-    mount | grep "$ROOT_MNT" | head -5
-    
+
+    log "Overlay mounted di $ROOT_MNT"
+
+    # Bind mount boot media ke dalam rootfs
+    mkdir -p "$ROOT_MNT/mnt/bootmedia" 2>/dev/null
+    mount --bind "$BOOT_MNT" "$ROOT_MNT/mnt/bootmedia" 2>/dev/null || \
+        warn "Gagal bind mount boot media"
+
+    # Bind mount pseudo-filesystems ke newroot
+    # Gunakan --bind bukan --move karena rootfs shared mount
+    for fs in dev proc sys run; do
+        if [ -d "/$fs" ] && [ -d "$ROOT_MNT/$fs" ]; then
+            if mount --bind "/$fs" "$ROOT_MNT/$fs" 2>/dev/null; then
+                log "Bind mounted /$fs ke $ROOT_MNT/$fs"
+            else
+                warn "Gagal bind /$fs, coba mount langsung..."
+                case "$fs" in
+                    dev)
+                        mount -t devtmpfs devtmpfs "$ROOT_MNT/dev" 2>/dev/null || \
+                            warn "devtmpfs di newroot gagal"
+                        ;;
+                    proc)
+                        mount -t proc proc "$ROOT_MNT/proc" 2>/dev/null || \
+                            warn "proc di newroot gagal"
+                        ;;
+                    sys)
+                        mount -t sysfs sysfs "$ROOT_MNT/sys" 2>/dev/null || \
+                            warn "sysfs di newroot gagal"
+                        ;;
+                    run)
+                        mount -t tmpfs tmpfs "$ROOT_MNT/run" 2>/dev/null || \
+                            warn "tmpfs run di newroot gagal"
+                        ;;
+                esac
+            fi
+        fi
+    done
+
+    # devpts di newroot
+    mkdir -p "$ROOT_MNT/dev/pts" 2>/dev/null
+    mount -t devpts devpts "$ROOT_MNT/dev/pts" -o gid=5,mode=620 2>/dev/null || \
+        warn "devpts di newroot gagal"
+
+    # Pastikan /dev/null ada
+    [ -c "$ROOT_MNT/dev/null" ] || \
+        mknod -m 666 "$ROOT_MNT/dev/null" c 1 3 2>/dev/null
+
+    # Pastikan /dev/console ada
+    [ -c "$ROOT_MNT/dev/console" ] || \
+        mknod -m 600 "$ROOT_MNT/dev/console" c 5 1 2>/dev/null
+
+    log "Root filesystem siap di $ROOT_MNT"
     echo "$ROOT_MNT"
     return 0
 }
 
 # ============================================
-# Find init in new root
+# Dump debug info rootfs
 # ============================================
 
-find_init() {
+dump_rootfs_info() {
     local ROOT_MNT="$1"
-    
-    log "Searching for init in $ROOT_MNT..."
-    
-    # Check override init
+
+    log "=== DEBUG ROOTFS ==="
+    log "Isi $ROOT_MNT:"
+    ls "$ROOT_MNT/" 2>/dev/null
+
+    log "Isi $ROOT_MNT/sbin/:"
+    ls -la "$ROOT_MNT/sbin/" 2>/dev/null | head -20
+
+    log "Isi $ROOT_MNT/bin/:"
+    ls "$ROOT_MNT/bin/" 2>/dev/null | head -10
+
+    log "Dynamic linker:"
+    ls "$ROOT_MNT/lib/"ld-*     2>/dev/null
+    ls "$ROOT_MNT/lib64/"ld-*   2>/dev/null
+    ls "$ROOT_MNT/usr/lib/"ld-* 2>/dev/null
+
+    log "file /sbin/init:"
+    file "$ROOT_MNT/sbin/init" 2>/dev/null || \
+        log "(file command tidak tersedia di initramfs)"
+
+    log "Mount table:"
+    mount | grep -E "newroot|squash|overlay|cow"
+
+    log "=== END DEBUG ==="
+}
+
+# ============================================
+# Cari dan verifikasi init
+# ============================================
+
+find_root_init() {
+    local ROOT_MNT="$1"
+
+    # Override dari cmdline
     if [ -n "$OVERRIDE_INIT" ]; then
         if [ -x "$ROOT_MNT$OVERRIDE_INIT" ]; then
-            log "Using override init: $OVERRIDE_INIT"
+            log "Using cmdline init: $OVERRIDE_INIT"
             echo "$OVERRIDE_INIT"
             return 0
+        else
+            error "Override init tidak ada: $ROOT_MNT$OVERRIDE_INIT"
         fi
     fi
-    
-    # Standard init locations
-    for init in /sbin/init /usr/sbin/init /bin/init /usr/bin/init /init; do
+
+    # Cek kandidat
+    for init in \
+        /sbin/init \
+        /usr/sbin/init \
+        /bin/init \
+        /usr/bin/init \
+        /usr/lib/systemd/systemd \
+        /lib/systemd/systemd \
+        /sbin/openrc-init \
+        /init
+    do
         if [ -x "$ROOT_MNT$init" ]; then
             log "Found init: $init"
             echo "$init"
             return 0
         fi
     done
-    
-    # Fallback to shell
+
+    # Fallback /bin/sh
     if [ -x "$ROOT_MNT/bin/sh" ]; then
-        warn "No init found, using /bin/sh"
+        warn "Fallback ke /bin/sh"
         echo "/bin/sh"
         return 0
     fi
-    
-    error "No init or shell found"
+
     return 1
 }
 
 # ============================================
-# Main
+# Cleanup sebelum switch_root
 # ============================================
 
-log "========================================="
-log "LeakOS Live Initramfs Starting"
-log "========================================="
+cleanup() {
+    log "Cleaning up..."
+    killall udevd 2>/dev/null
+    killall systemd-udevd 2>/dev/null
+    # Jangan umount /dev/pts di initramfs karena sudah dibind ke newroot
+}
+
+# ============================================
+# MAIN
+# ============================================
+
+log "=== LeakOS Live Initramfs Starting ==="
 log "Kernel: $(uname -r)"
 
-# Initialize
 mount_base
 parse_cmdline
 load_modules
 setup_loop_devices
 start_udev
 
-# Wait for devices
-sleep 3
-
-# Mount root filesystem
 ROOT_MNT=$(mount_root)
 if [ -z "$ROOT_MNT" ]; then
-    error "Failed to mount root filesystem"
+    error "Gagal mount root filesystem!"
     emergency_shell
 fi
 
-# Find init
-ROOT_INIT=$(find_init "$ROOT_MNT")
+dump_rootfs_info "$ROOT_MNT"
+
+ROOT_INIT=$(find_root_init "$ROOT_MNT")
 if [ -z "$ROOT_INIT" ]; then
-    error "No init found"
+    error "Init tidak ditemukan di $ROOT_MNT!"
     emergency_shell
 fi
 
-# Cleanup
-log "Cleaning up..."
-killall udevd 2>/dev/null
-sleep 1
+cleanup
 
-# Switch to new root
-log "Switching to new root with init: $ROOT_INIT"
+log "Switching to $ROOT_MNT with init $ROOT_INIT"
+
 exec switch_root "$ROOT_MNT" "$ROOT_INIT"
 
-# If we get here, something went wrong
-error "switch_root failed"
+error "switch_root GAGAL!"
 emergency_shell
